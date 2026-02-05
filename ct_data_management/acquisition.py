@@ -22,7 +22,7 @@ class NSCLCRadiomicsDataManager:
             SeriesDescription,
             ImageType
         FROM
-            nsclc_radiomics
+            index
         WHERE
             Modality = 'CT' AND
             SeriesDescription LIKE '%STANDARD%' AND
@@ -36,7 +36,7 @@ class NSCLCRadiomicsDataManager:
             SeriesDescription,
             ImageType
         FROM
-            nsclc_radiomics
+            index
         WHERE
             Modality = 'SEG' AND
             SeriesDescription LIKE 'AIMI lung and nodule %';
@@ -102,7 +102,7 @@ class NSCLCRadiomicsDataManager:
         index.IDCClient().download_dicom_series(
             seriesInstanceUID=all_series,
             downloadDir=self._data_path,
-            dirTemplate='%PatientID/%StudyInstanceUID/%Modality_%SeriesInstanceUID'
+            dirTemplate='%PatientID/%StudyInstanceUID/%SeriesInstanceUID'
         )
         return self
 
@@ -115,15 +115,18 @@ class NSCLCRadiomicsDataManager:
 
         if run_validation: 
             all_db_series = self._metadata_cache['SeriesInstanceUID_ct'].tolist() + self._metadata_cache['SeriesInstanceUID_seg'].tolist()
-            all_fs_series = [os.path.basename(p) for p in glob(os.path.join(self._data_path, '*', '*'))]
+            all_fs_series = [os.path.basename(p) for p in glob(os.path.join(self._data_path, '*', '*', '*'))]
+
             if not set(all_db_series) <= set(all_fs_series):
                 raise DataIntegrityError('Local files did not match up with metadata.')
 
         ct_paths = self._metadata_cache.apply(
-            lambda r: os.path.join(self._data_path, r['PatientID'], r['StudyInstanceUID'], r['SeriesInstanceUID_ct'])
+            lambda r: os.path.join(self._data_path, r['PatientID'], r['StudyInstanceUID'], r['SeriesInstanceUID_ct']),
+            axis=1
         )
         seg_paths = self._metadata_cache.apply(
-            lambda r: os.path.join(self._data_path, r['PatientID'], r['StudyInstanceUID'], r['SeriesInstanceUID_seg'])
+            lambda r: os.path.join(self._data_path, r['PatientID'], r['StudyInstanceUID'], r['SeriesInstanceUID_seg']),
+            axis=1
         )
         return zip(ct_paths, seg_paths)
 
@@ -138,7 +141,7 @@ class NSCLCRadiomicsDataManager:
         metadata_df = pd.merge(
             ct_df,
             seg_df,
-            on=['SeriesInstanceUID'],
+            on=['PatientID', 'StudyInstanceUID'],
             suffixes=('_ct', '_seg')
         )
         metadata_df['Priority'] = metadata_df['SeriesDescription_seg'].apply(

@@ -25,7 +25,9 @@ if __name__ == '__main__':
 
     torch.set_grad_enabled(False)  # No need for gradient calculation in this script
 
-    data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH).sync_metadata().sync_data()
+    #data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH).sync_metadata().sync_data()
+    #data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH).sync_data()
+    data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH)
 
     pipeline = PipelineStack([
         NSCLCRadiomicsReader(),
