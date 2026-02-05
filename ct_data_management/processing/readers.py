@@ -1,5 +1,3 @@
-import pydicom
-from pathlib import Path
 import torch
 import monai.transforms as mt
 import numpy as np
@@ -10,38 +8,12 @@ class DICOMDataAnomalyError(Exception):
     pass
 
 
-class DICOMFileSystemReader(PipelinePart):
-    def find_series_paths(self, read_path):
-        read_path = Path(read_path)
-        if not read_path.exists():
-            raise FileNotFoundError()
-        ct_path = None
-        seg_path = None
-        
-        for series_path in read_path.glob('*'):
-            all_files = list(series_path.glob('*.dcm'))
-            modality = pydicom.dcmread(all_files[0], stop_before_pixels=True).Modality
-
-            if len(all_files) > 1 and modality == 'CT':
-                if ct_path is None:
-                    ct_path = series_path
-                else:
-                    raise DICOMDataAnomalyError('Multiple CT DICOM series were found.')
-            elif len(all_files) == 1 and modality == 'SEG':
-                if seg_path is None:
-                    seg_path = series_path
-                else:
-                    raise DICOMDataAnomalyError('Multiple SEG DICOM series were found.')
-
-        return ct_path, seg_path
-
-
-class NSCLCRadiomicsReader(DICOMFileSystemReader):
+class NSCLCRadiomicsReader(PipelinePart):
     _CT_BACKEND = mt.LoadImage('ITKReader', image_only=True, ensure_channel_first=True, dtype=np.float32)
     _SEG_BACKEND = mt.LoadImage('PydicomReader', image_only=True, ensure_channel_first=True, dtype=np.float32)
 
     def __call__(self, *data, **params):
-        ct_path, seg_path = self.find_series_paths(params['read_path'])
+        ct_path, seg_path = data
 
         ct_data = None
         seg_data = None
@@ -72,7 +44,11 @@ class NSCLCRadiomicsReader(DICOMFileSystemReader):
         return (ct_data, seg_data), params
 
 
-class NLSTReader(DICOMFileSystemReader):
+class NLSTReader(PipelinePart):
+    pass
+
+
+class LIDCIDRIReader(PipelinePart):
     pass
 
 

@@ -8,11 +8,11 @@ class PipelinePart(ABC):
 
 
 class PipelineStack(PipelinePart):
-    def __init__(self, transforms):
-        self._transforms = transforms
+    def __init__(self, pipeline_parts):
+        self._pipeline_parts = pipeline_parts
 
     def __call__(self, *data, **params):
-        for t in self._transforms:
-            data, params = t(*data, **params)
+        for pp in self._pipeline_parts:
+            data, params = pp(*data, **params)
         return data, params
 
