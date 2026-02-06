@@ -21,16 +21,17 @@ def generate_uid(path):
 if __name__ == '__main__':
     METADATA_PATH = '/mnt/seagate_exp/radiology/data/nsclc_radiomics_metadata.duckdb'
     DATA_PATH =     '/mnt/seagate_exp/radiology/data/raw/nsclc_radiomics'
-    SAVE_PATH =     '/mnt/seagate_exp/radiology/data/tmp/nsclc_radiomics'
+    SAVE_PATH =     '/mnt/seagate_exp/radiology/data/processed/nsclc_radiomics'
 
     torch.set_grad_enabled(False)  # No need for gradient calculation in this script
 
     #data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH).sync_metadata().sync_data()
+    #data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH).sync_metadata()
     #data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH).sync_data()
     data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH)
 
     pipeline = PipelineStack([
-        NSCLCRadiomicsReader(),
+        NSCLCRadiomicsReader(lung_seg_labels=['lung'], nodule_seg_labels=['nodule']),
         OrientTransform(),
         ResampleTransform(),
         #CropLungRegionTransform(scale_factor=1 / 16, min_value=-960, max_value=-400, padding=0),
@@ -39,7 +40,7 @@ if __name__ == '__main__':
         #InteractiveViewer(),
     ])
 
-    for ct_path, seg_path in tqdm(data_manager.get_paths()):
+    for ct_path, seg_path in tqdm(list(data_manager.get_paths())):
         new_uid = generate_uid(ct_path)
         pipeline(
             ct_path,
