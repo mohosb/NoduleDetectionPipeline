@@ -13,11 +13,12 @@ class ClipAndNormTransform(PipelinePart):
     def __call__(self, *data, **params):
         ct_data, seg_data = data
 
-        ct_data.clip_(self.clip_min, self.clip_max)
+        if ct_data is not None:
+            ct_data.clip_(self.clip_min, self.clip_max)
 
-        ct_data_min = ct_data.min()
-        ct_data_max = ct_data.max()
-        ct_data = (ct_data - ct_data_min) / (ct_data_max - ct_data_min)
+            ct_data_min = ct_data.min()
+            ct_data_max = ct_data.max()
+            ct_data = (ct_data - ct_data_min) / (ct_data_max - ct_data_min)
 
         return (ct_data, seg_data), params
 

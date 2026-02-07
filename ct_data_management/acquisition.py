@@ -153,6 +153,7 @@ class NSCLCRadiomicsDataManager:
             subset=['SeriesInstanceUID_ct'],
             keep='first'
         )
+        metadata_df.sort_values('SeriesInstanceUID_ct', inplace=True)  # Make runs accross devices deterministic
 
         if run_validation: 
             all_db_series = metadata_df['SeriesInstanceUID_ct'].tolist() + metadata_df['SeriesInstanceUID_seg'].tolist()

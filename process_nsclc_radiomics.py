@@ -31,7 +31,7 @@ if __name__ == '__main__':
     data_manager = NSCLCRadiomicsDataManager(METADATA_PATH, DATA_PATH)
 
     pipeline = PipelineStack([
-        NSCLCRadiomicsReader(lung_seg_labels=['lung'], nodule_seg_labels=['nodule']),
+        NSCLCRadiomicsReader(lung_seg_labels=['lung'], nodule_seg_labels=['neoplasm']),
         OrientTransform(),
         ResampleTransform(),
         #CropLungRegionTransform(scale_factor=1 / 16, min_value=-960, max_value=-400, padding=0),
