@@ -1,7 +1,7 @@
 from ct_data_management.acquisition import NSCLCRadiomicsDataManager
 from ct_data_management.processing.pipeline import PipelineStack
-from ct_data_management.processing.readers import NSCLCRadiomicsReader
-from ct_data_management.processing.transforms import OrientTransform, ResampleTransform, CropLungRegionTransform, ClipAndNormTransform
+from ct_data_management.processing.readers import NSCLCRadiomicsReader, DICOMDataAnomalyError
+from ct_data_management.processing.transforms import OrientTransform, ResampleTransform, CropLungRegionTransform, ClipAndNormTransform, ToDeviceTransform
 from ct_data_management.processing.writers import NPZWriter
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
@@ -42,11 +42,17 @@ if __name__ == '__main__':
 
     for ct_path, seg_path in tqdm(list(data_manager.get_paths())):
         new_uid = generate_uid(ct_path)
-        pipeline(
-            ct_path,
-            seg_path,
-            ct_save_path=f'ct/{new_uid}',
-            seg_save_path=f'seg/{new_uid}',
-            base_save_path=SAVE_PATH,
-        )
+        try:
+            pipeline(
+                ct_path,
+                seg_path,
+                ct_save_path=f'ct/{new_uid}',
+                seg_save_path=f'seg/{new_uid}',
+                base_save_path=SAVE_PATH,
+            )
+        except DICOMDataAnomalyError as e:
+            print('Error:', e)
+            print('CT file:', ct_path)
+            print('SEG file:', seg_path)
+            print('Skipping files...')
 

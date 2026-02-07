@@ -1,7 +1,5 @@
 import torch
 import monai.transforms as mt
-import numpy as np
-import tempfile
 import subprocess
 import os
 import pydicom
@@ -16,7 +14,7 @@ class DICOMDataAnomalyError(Exception):
 
 
 class NSCLCRadiomicsReader(PipelinePart):
-    def __init__(self, lung_seg_labels=tuple(), nodule_seg_labels=tuple(), backend='ITKReader', dtype=np.float32):
+    def __init__(self, lung_seg_labels=tuple(), nodule_seg_labels=tuple(), backend='ITKReader', dtype=None):
         self._backend = mt.LoadImage(backend, image_only=True, ensure_channel_first=True, dtype=dtype)
         self._lung_seg_labels = lung_seg_labels
         self._nodule_seg_labels = nodule_seg_labels

@@ -49,6 +49,19 @@ class ResampleTransform(PipelinePart):
         return (ct_data, seg_data), params
 
 
+class ToDeviceTransform(PipelinePart):
+    def __init__(self, device='cpu'):
+        self._device = torch.device(device)
+
+    def __call__(self, *data, **params):
+        ct_data, seg_data = data
+        if ct_data is not None:
+            ct_data = ct_data.to(self._device)
+        if seg_data is not None:
+            seg_data = seg_data.to(self._device)
+        return (ct_data, seg_data), params
+
+
 class CropLungRegionTransform(PipelinePart):
     def __init__(self, scale_factor=0.25, min_value=-960, max_value=-400, padding=10):
         self.downsample_factor = scale_factor
