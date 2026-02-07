@@ -1,0 +1,6 @@
+monai[all]
+pydicom
+dcm2niix
+s5cmd
+idc-index
+
