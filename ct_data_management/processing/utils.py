@@ -34,7 +34,7 @@ class InteractiveViewer(PipelinePart):
                     cmap=ListedColormap(['none', color])
                 )
 
-        blended = blended.numpy().transpose(3, 1, 2, 0)
+        blended = blended.numpy().transpose(3, 2, 1, 0)
         z_max = blended.shape[0] - 1
 
         current_idx = 0
@@ -42,7 +42,7 @@ class InteractiveViewer(PipelinePart):
         fig, ax = plt.subplots()
         
         is_float = blended.max() <= 1.0
-        im = ax.imshow(blended[current_idx], vmin=0, vmax=(1 if is_float else 255)) # Assuming 0-1 range based on your description
+        im = ax.imshow(blended[current_idx, ::-1, :], vmin=0, vmax=(1 if is_float else 255)) # Assuming 0-1 range based on your description
         plt.subplots_adjust(left=0, right=1, bottom=0, top=1)
         ax.axis('off')
 
