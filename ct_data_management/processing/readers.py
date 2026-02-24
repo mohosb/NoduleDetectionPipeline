@@ -13,7 +13,7 @@ class DICOMDataAnomalyError(Exception):
     pass
 
 
-class NSCLCRadiomicsReader(PipelinePart):
+class DICOMFileSystemReader(PipelinePart):
     def __init__(self, lung_seg_labels=tuple(), nodule_seg_labels=tuple(), backend='ITKReader', dtype=None):
         self._backend = mt.LoadImage(backend, image_only=True, ensure_channel_first=True, dtype=dtype)
         self._lung_seg_labels = lung_seg_labels
@@ -74,14 +74,6 @@ class NSCLCRadiomicsReader(PipelinePart):
             )
             data = self._backend(os.path.join(temp_dir, '_temp_dcm2niix_file.nii'))
         return data
-
-
-class NLSTReader(PipelinePart):
-    pass
-
-
-class LIDCIDRIReader(PipelinePart):
-    pass
 
 
 class PAXReader(PipelinePart):

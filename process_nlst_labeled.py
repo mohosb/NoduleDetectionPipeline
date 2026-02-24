@@ -1,4 +1,4 @@
-from ct_data_management.acquisition import CTDataManager, nsclc_radiomics_info
+from ct_data_management.acquisition import CTDataManager, nlst_labeled_info
 from ct_data_management.processing.pipeline import PipelineStack
 from ct_data_management.processing.readers import DICOMFileSystemReader, DICOMDataAnomalyError
 from ct_data_management.processing.transforms import OrientTransform, ResampleTransform, ClipAndNormTransform, ToDeviceTransform
@@ -19,20 +19,19 @@ def generate_uid(path):
 
 
 if __name__ == '__main__':
-    METADATA_PATH = '/mnt/seagate_exp/radiology/data/nsclc_radiomics_metadata.duckdb'
-    DATA_PATH =     '/mnt/seagate_exp/radiology/data/raw/nsclc_radiomics'
-    SAVE_PATH =     '/mnt/seagate_exp/radiology/data/processed/nsclc_radiomics'
-    #SAVE_PATH =     '/mnt/seagate_exp/radiology/data/processed2/nsclc_radiomics'
+    METADATA_PATH = '/mnt/seagate_exp/radiology/data/nlst_labeled_metadata.duckdb'
+    DATA_PATH =     '/mnt/seagate_exp/radiology/data/raw/nlst_labeled'
+    SAVE_PATH =     '/mnt/seagate_exp/radiology/data/processed/nlst_labeled'
 
     torch.set_grad_enabled(False)  # No need for gradient calculation in this script
 
-    #data_manager = CTDataManager(nsclc_radiomics_info, METADATA_PATH, DATA_PATH).sync_metadata().sync_data()
-    #data_manager = CTDataManager(nsclc_radiomics_info, METADATA_PATH, DATA_PATH).sync_metadata()
-    #data_manager = CTDataManager(nsclc_radiomics_info, METADATA_PATH, DATA_PATH).sync_data()
-    data_manager = CTDataManager(nsclc_radiomics_info, METADATA_PATH, DATA_PATH)
+    data_manager = CTDataManager(nlst_labeled_info, METADATA_PATH, DATA_PATH).sync_metadata().sync_data()
+    #data_manager = CTDataManager(nlst_labeled_info, METADATA_PATH, DATA_PATH).sync_metadata()
+    #data_manager = CTDataManager(nlst_labeled_info, METADATA_PATH, DATA_PATH).sync_data()
+    #data_manager = CTDataManager(nlst_labeled_info, METADATA_PATH, DATA_PATH)
 
     pipeline = PipelineStack([
-        DICOMFileSystemReader(lung_seg_labels=['lung'], nodule_seg_labels=['neoplasm']),
+        DICOMFileSystemReader(lung_seg_labels=['lung'], nodule_seg_labels=['nodule']),
         OrientTransform(),
         ResampleTransform(),
         ClipAndNormTransform(clip_min=-1000, clip_max=400),

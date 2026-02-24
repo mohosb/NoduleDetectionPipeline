@@ -12,13 +12,35 @@ from abc import ABC, abstractmethod, abstractproperty
 from .utils import SmartTemporaryDirectory
 
 
+class nsclc_radiomics_info:
+    COLLECTION_ID = 'nsclc_radiomics'
+    CT_QUERY_CONDITIONS = '''
+        Modality = 'CT';
+    '''
+    SEG_QUERY_CONDITIONS = ''' 
+        Modality = 'SEG' AND
+        SeriesDescription = 'Segmentation';
+    '''
+
+
+class nlst_labeled_info:
+    COLLECTION_ID = 'nlst'
+    CT_QUERY_CONDITIONS = '''
+        Modality = 'CT' AND
+        SeriesDescription LIKE '%STANDARD%';
+    '''
+    SEG_QUERY_CONDITIONS = '''
+        Modality = 'SEG' AND
+        SeriesDescription LIKE 'AIMI lung and nodule %';
+    '''
+
+
 class DataIntegrityError(Exception):
     pass
 
 
-class NSCLCRadiomicsDataManager:
-    COLLECTION_ID = 'nsclc_radiomics'
-    CT_QUERY = f'''
+class CTDataManager:
+    LOCAL_BASE_QUERY = '''
         SELECT
             PatientID,
             StudyInstanceUID,
@@ -26,23 +48,11 @@ class NSCLCRadiomicsDataManager:
             SeriesDescription
         FROM
             index
-        WHERE
-            Modality = 'CT';
-    '''
-    SEG_QUERY = '''
-        SELECT
-            PatientID,
-            StudyInstanceUID,
-            SeriesInstanceUID,
-            SeriesDescription
-        FROM
-            index
-        WHERE
-            Modality = 'SEG' AND
-            SeriesDescription = 'Segmentation';
+        WHERE 
     '''
 
-    def __init__(self, metadata_path, data_path):
+    def __init__(self, dataset_info, metadata_path, data_path):
+        self._dataset_info = dataset_info
         self._metadata_path = metadata_path
         self._data_path = data_path
         self._metadata_cache = None
@@ -83,7 +93,7 @@ class NSCLCRadiomicsDataManager:
                 process.stdout.close()
                 process.wait()
         
-            print(f'Ingesting {self.COLLECTION_ID} metadata files...')
+            print(f'Ingesting {self._dataset_info.COLLECTION_ID} metadata files...')
 
             start_time = time.time()
             temp_files = glob(os.path.join(temp_dir, '*.parquet'))
@@ -103,7 +113,7 @@ class NSCLCRadiomicsDataManager:
                     read_parquet(?)
                 WHERE
                     collection_id = ?;
-            ''', [temp_files, self.COLLECTION_ID])
+            ''', [temp_files, self._dataset_info.COLLECTION_ID])
             end_time = time.time()
 
         row_count = con.execute('SELECT count(*) FROM index').fetchone()[0]
@@ -117,9 +127,9 @@ class NSCLCRadiomicsDataManager:
         return self
 
     def sync_data(self):
-        with duckdb.connect(self._metadata_path) as con:
-            ct_df = con.execute(self.CT_QUERY).df()
-            seg_df = con.execute(self.SEG_QUERY).df()
+        with duckdb.connect(self._metadata_path) as con: 
+            ct_df = con.execute(self.LOCAL_BASE_QUERY + self._dataset_info.CT_QUERY_CONDITIONS).df()
+            seg_df = con.execute(self.LOCAL_BASE_QUERY + self._dataset_info.SEG_QUERY_CONDITIONS).df()
 
         all_series = ct_df['SeriesInstanceUID'].tolist() + seg_df['SeriesInstanceUID'].tolist()
 
@@ -140,8 +150,8 @@ class NSCLCRadiomicsDataManager:
 
     def get_paths(self, run_validation=True):
         with duckdb.connect(self._metadata_path) as con:
-            ct_df = con.execute(self.CT_QUERY).df()
-            seg_df = con.execute(self.SEG_QUERY).df()
+            ct_df = con.execute(self.LOCAL_BASE_QUERY + self._dataset_info.CT_QUERY_CONDITIONS).df()
+            seg_df = con.execute(self.LOCAL_BASE_QUERY + self._dataset_info.SEG_QUERY_CONDITIONS).df()
 
         metadata_df = pd.merge(
             ct_df,
@@ -172,33 +182,4 @@ class NSCLCRadiomicsDataManager:
         )
         return zip(ct_paths, seg_paths)
 
-    
-# Querys for NLST:
-"""
-CT_QUERY = f'''
-    SELECT
-        PatientID,
-        StudyInstanceUID,
-        SeriesInstanceUID,
-        SeriesDescription
-    FROM
-        index
-    WHERE
-        Modality = 'CT' AND
-        SeriesDescription LIKE '%STANDARD%' AND
-        list_contains(ImageType, 'PRIMARY');
-'''
-SEG_QUERY = '''
-    SELECT
-        PatientID,
-        StudyInstanceUID,
-        SeriesInstanceUID,
-        SeriesDescription
-    FROM
-        index
-    WHERE
-        Modality = 'SEG' AND
-        SeriesDescription LIKE 'AIMI lung and nodule %';
-'''
-"""
 
