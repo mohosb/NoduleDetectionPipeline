@@ -14,7 +14,7 @@ class DICOMDataAnomalyError(Exception):
 
 
 class DICOMFileSystemReader(PipelinePart):
-    def __init__(self, lung_seg_labels=tuple(), nodule_seg_labels=tuple(), backend='ITKReader', dtype=None):
+    def __init__(self, lung_seg_labels=tuple(), nodule_seg_labels=tuple(), backend='NibabelReader', dtype=None):
         self._backend = mt.LoadImage(backend, image_only=True, ensure_channel_first=True, dtype=dtype)
         self._lung_seg_labels = lung_seg_labels
         self._nodule_seg_labels = nodule_seg_labels
@@ -29,7 +29,7 @@ class DICOMFileSystemReader(PipelinePart):
             ct_data = self._read_dicom(ct_path)
 
         if seg_path is not None:
-            seg_data = self._read_dicom(seg_path)
+            seg_data = self._read_dicom(seg_path) 
 
             seg_header = pydicom.dcmread(glob(os.path.join(seg_path, '*.dcm'))[0], stop_before_pixels=True)
             lung_segments = set()
@@ -55,7 +55,7 @@ class DICOMFileSystemReader(PipelinePart):
 
             if len(lung_segments) == 0:
                 raise DICOMDataAnomalyError('No Lung instance could be detected in SEG DICOM file.')
-    
+   
             # Union Region of Interest instances into a single instance and separate the nodule(s)
             roi_data = seg_data[list(lung_segments.union(nodule_segments))].sum(0).clamp_(0, 1)
             nodule_data = seg_data[list(nodule_segments)].sum(0).clamp_(0, 1)
@@ -75,7 +75,7 @@ class DICOMFileSystemReader(PipelinePart):
             data = self._backend(os.path.join(temp_dir, '_temp_dcm2niix_file.nii'))
         return data
 
-
+    
 class PAXReader(PipelinePart):
     pass
 
