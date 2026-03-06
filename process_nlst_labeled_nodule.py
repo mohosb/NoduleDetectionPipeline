@@ -1,21 +1,13 @@
 from ct_data_management.acquisition import IDCFileSystemDataManager, NLST_LABELED_INFO
 from ct_data_management.processing.pipeline import PipelineStack
-from ct_data_management.processing.readers import DICOMFileSystemReader, DICOMDataAnomalyError
-from ct_data_management.processing.transforms import OrientTransform, ResampleTransform, ClipAndNormTransform, ToDeviceTransform
+from ct_data_management.processing.readers import DICOMFileSystemReader
+from ct_data_management.processing.transforms import *
 from ct_data_management.processing.writers import NPZWriter
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
 import torch
 import os
-import hashlib
 from tqdm import tqdm
-
-
-def generate_uid(path):
-    patient_id, studey_uid = str(path).split('/')[-3:-1]
-    # 16 bit UID ~ 1 in 14 billion chanche for collision for 1 million datapoints
-    uid = hashlib.shake_256((patient_id + studey_uid).encode()).hexdigest(8)
-    return uid
 
 
 if __name__ == '__main__':
@@ -28,28 +20,23 @@ if __name__ == '__main__':
     data_manager = IDCFileSystemDataManager(DATA_PATH, NLST_LABELED_INFO)
 
     pipeline = PipelineStack([
-        DICOMFileSystemReader(lung_seg_labels=['lung'], nodule_seg_labels=['nodule']),
+        DICOMFileSystemReader(return_headers=True, dtype=torch.float16),
+        IDGenerator(),
+        FilterSegmentsTransform(target_labels=['nodule'], min_num_segments=1),
         OrientTransform(),
         ResampleTransform(),
+        MergeSegmentsTransform(),
         ClipAndNormTransform(clip_min=-1000, clip_max=400),
-        NPZWriter(),
+        NPZWriter(os.path.join(SAVE_PATH, 'ct'), os.path.join(SAVE_PATH, 'nodule_seg')),
         #InteractiveViewer(),
     ])
 
-    for ct_path, seg_path in tqdm(list(data_manager.get_paths())):
-        new_uid = generate_uid(ct_path)
+    for ct_path, seg_path_list in tqdm(list(data_manager.get_paths())):
         try:
-            pipeline(
-                ct_path,
-                seg_path,
-                ct_save_path=f'ct/{new_uid}',
-                seg_save_path=f'seg/{new_uid}',
-                base_save_path=SAVE_PATH,
-            )
-        #except DICOMDataAnomalyError as e:
+            pipeline(ct_path, seg_path_list)
         except Exception as e:
             print('Error:', e)
             print('CT file:', ct_path)
-            print('SEG file:', seg_path)
+            print('SEG file list:', seg_path_list)
             print('Skipping files...')
 

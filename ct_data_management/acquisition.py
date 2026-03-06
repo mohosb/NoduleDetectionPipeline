@@ -1,29 +1,30 @@
-import duckdb
 from idc_index import index
 import pandas as pd
-import re
 import os
-import time
-import subprocess
 import warnings
 import pydicom
 import shutil
 from tqdm import tqdm
 from glob import glob
-from abc import ABC, abstractmethod, abstractproperty
-from .utils import SmartTemporaryDirectory
 
 
 class NSCLC_RADIOMICS_INFO:
     COLLECTION_ID = 'nsclc_radiomics'
     CT_QUERY_CONDITIONS = '''
-        Modality = 'CT';
+        TRUE
     '''
     SEG_QUERY_CONDITIONS = ''' 
-        Modality = 'SEG' AND
-        SeriesDescription = 'Segmentation';
+        SeriesDescription = 'Segmentation'
     '''
 
+class LIDC_IDRI_INFO:
+    COLLECTION_ID = 'lidc_idri'
+    CT_QUERY_CONDITIONS = '''
+        TRUE
+    '''
+    SEG_QUERY_CONDITIONS = '''
+        SeriesDescription LIKE 'Segmentation of Nodule %'
+    '''
 
 class NLST_LABELED_INFO:
     COLLECTION_ID = 'nlst'
@@ -76,7 +77,7 @@ class IDCFileSystemDataManager:
         print('Digesting data...')
 
         ct_ids = []
-        for series_path in tqdm(glob(os.path.join(seg_dir, '*'))):
+        for series_path in tqdm([os.path.join(seg_dir, seg_id) for seg_id in seg_ids]):
             seg_file = glob(os.path.join(series_path, '*.dcm'))[0]
             seg_metadata = pydicom.dcmread(seg_file, stop_before_pixels=True)
 
@@ -112,6 +113,14 @@ class IDCFileSystemDataManager:
         metadata_path = os.path.join(self._data_path, 'metadata.csv')
         metadata = pd.read_csv(metadata_path, header=0)
 
-        for row in metadata.itertuples(index=False):
-            yield os.path.join(self._data_path, 'ct', row[0]), os.path.join(self._data_path, 'seg', row[1])
+        grouped_metadata = metadata.groupby('CTSeriesInstanceUID')['SEGSeriesInstanceUID'].apply(list).reset_index()
+
+        for row in grouped_metadata.itertuples(index=False):
+            ct_id = row.CTSeriesInstanceUID
+            seg_ids = row.SEGSeriesInstanceUID
+            
+            ct_path = os.path.join(self._data_path, 'ct', ct_id)
+            seg_paths = [os.path.join(self._data_path, 'seg', seg_id) for seg_id in seg_ids]
+            
+            yield ct_path, seg_paths
 

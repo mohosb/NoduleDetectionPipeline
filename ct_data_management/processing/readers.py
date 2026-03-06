@@ -9,61 +9,36 @@ from .pipeline import PipelinePart
 from ..utils import SmartTemporaryDirectory
 
 
-class DICOMDataAnomalyError(Exception):
-    pass
-
-
 class DICOMFileSystemReader(PipelinePart):
-    def __init__(self, lung_seg_labels=tuple(), nodule_seg_labels=tuple(), backend='NibabelReader', dtype=None):
+    def __init__(self, backend='NibabelReader', dtype=None, return_headers=True):
         self._backend = mt.LoadImage(backend, image_only=True, ensure_channel_first=True, dtype=dtype)
-        self._lung_seg_labels = lung_seg_labels
-        self._nodule_seg_labels = nodule_seg_labels
+        self._return_headers = return_headers
 
     def __call__(self, *data, **params):
-        ct_path, seg_path = data
+        ct_path, seg_path_list = data
 
         ct_data = None
-        seg_data = None
+        seg_data_list = None
 
         if ct_path is not None:
+            if self._return_headers:
+                params['ct_header'] = pydicom.dcmread(glob(os.path.join(ct_path, '*.dcm'))[0], stop_before_pixels=True)
+                #params['ct_id'] = ct_path.split('/')[-1]
+
             ct_data = self._read_dicom(ct_path)
 
-        if seg_path is not None:
-            seg_data = self._read_dicom(seg_path) 
+        if seg_path_list is not None:
+            if self._return_headers:
+                params['seg_header_list'] = [
+                    pydicom.dcmread(glob(os.path.join(seg_path, '*.dcm'))[0], stop_before_pixels=True) for seg_path in seg_path_list
+                ]
+                #params['seg_id'] = seg_path.split('/')[-1]
 
-            seg_header = pydicom.dcmread(glob(os.path.join(seg_path, '*.dcm'))[0], stop_before_pixels=True)
-            lung_segments = set()
-            nodule_segments = set()
-            if 'SegmentSequence' in seg_header:
-                for item in seg_header.SegmentSequence:
-                    seg_num = item.SegmentNumber - 1  # DICOM files start indexing from 1
-                    
-                    if 'SegmentLabel' in item:
-                        seg_label = item.SegmentLabel
-                    elif 'SegmentDescription' in item:
-                        seg_label = item.SegmentDescription
-                    else:
-                        seg_label = ''
+            seg_data_list = [self._read_dicom(seg_path) for seg_path in seg_path_list] 
 
-                    seg_label = seg_label.lower()
-                    for label_pattern in self._lung_seg_labels:
-                        if label_pattern in seg_label:
-                            lung_segments.add(seg_num)
-                    for label_pattern in self._nodule_seg_labels:
-                        if label_pattern in seg_label:
-                            nodule_segments.add(seg_num)
+        return (ct_data, seg_data_list), params
 
-            if len(lung_segments) == 0:
-                raise DICOMDataAnomalyError('No Lung instance could be detected in SEG DICOM file.')
-   
-            # Union Region of Interest instances into a single instance and separate the nodule(s)
-            roi_data = seg_data[list(lung_segments.union(nodule_segments))].sum(0).clamp_(0, 1)
-            nodule_data = seg_data[list(nodule_segments)].sum(0).clamp_(0, 1)
-            seg_data = torch.stack((roi_data, nodule_data))
-
-        return (ct_data, seg_data), params
-
-    def _read_dicom(self, path):
+    def _read_dicom(self, path): 
         required_space = shutil.disk_usage(path)[1] / 1024 ** 3
         with SmartTemporaryDirectory(required_space) as temp_dir:
             subprocess.run(
@@ -75,6 +50,24 @@ class DICOMFileSystemReader(PipelinePart):
             data = self._backend(os.path.join(temp_dir, '_temp_dcm2niix_file.nii'))
         return data
 
+    '''
+    def _read_seg_dicom(self, path):
+        required_space = shutil.disk_usage(path)[1] / 1024 ** 3
+        with SmartTemporaryDirectory(required_space) as temp_dir:
+            subprocess.run(
+                [
+                    'segimage2itkimage', 
+                    '--inputDICOM', glob(os.path.join(path, '*.dcm'))[0], 
+                    '--outputDirectory', temp_dir, 
+                    '--outputType', 'nifti'
+                ], 
+                check=True, 
+                stdout=subprocess.DEVNULL, 
+                stderr=subprocess.PIPE
+            )
+            data = self._backend(glob(os.path.join(temp_dir, '*.nii.gz')))
+        return data
+    '''
     
 class PAXReader(PipelinePart):
     pass

@@ -21,7 +21,8 @@ class TimePipelinePart(PipelinePart):
 
 class InteractiveViewer(PipelinePart):
     def __call__(self, *data, **params):
-        ct_data, seg_data = data
+        ct_data, seg_data_list = data
+        seg_data = seg_data_list[0]
 
         blended = ct_data
         if seg_data is not None:
@@ -34,7 +35,7 @@ class InteractiveViewer(PipelinePart):
                     cmap=ListedColormap(['none', color])
                 )
 
-        blended = blended.numpy().transpose(3, 2, 1, 0)
+        blended = blended.numpy().transpose(3, 2, 1, 0)[:, ::-1]
         z_max = blended.shape[0] - 1
 
         current_idx = 0
@@ -42,7 +43,7 @@ class InteractiveViewer(PipelinePart):
         fig, ax = plt.subplots()
         
         is_float = blended.max() <= 1.0
-        im = ax.imshow(blended[current_idx, ::-1, :], vmin=0, vmax=(1 if is_float else 255)) # Assuming 0-1 range based on your description
+        im = ax.imshow(blended[current_idx], vmin=0, vmax=(1 if is_float else 255))
         plt.subplots_adjust(left=0, right=1, bottom=0, top=1)
         ax.axis('off')
 
@@ -59,7 +60,6 @@ class InteractiveViewer(PipelinePart):
             title.set_text(f'Slice {current_idx}')
             fig.canvas.draw_idle()
 
-        # 4. Event Handlers
         def on_scroll(event):
             step = 1 if event.button == 'up' else -1
             update_slice(step)
