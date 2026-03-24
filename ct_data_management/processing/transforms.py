@@ -9,12 +9,10 @@ class DataAnomalyError(Exception):
 
 
 class IDGenerator(PipelinePart):
-    def __call__(self, *data, **params):
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
         ct_header = params.get('ct_header', None)
-
         if ct_header is not None:
             params['id'] = ct_header.SeriesInstanceUID
-
         return data, params
 
 
@@ -23,13 +21,12 @@ class FilterSegmentsTransform(PipelinePart):
         self._target_labels = target_labels
         self._min_num_segments = min_num_segments
 
-    def __call__(self, *data, **params):
-        seg_header_list = params.get('seg_header_list', None) 
-
-        ct_data, seg_data_list = data
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        seg_header_list = params.get('seg_header_list', None)
+        seg_data_list   = data.get('seg_list')
 
         if seg_header_list is None:
-            return (ct_data, seg_data_list), params
+            return data, params
 
         new_seg_data_list = []
         for seg_header, seg_data in zip(seg_header_list, seg_data_list):
@@ -37,7 +34,7 @@ class FilterSegmentsTransform(PipelinePart):
             if 'SegmentSequence' in seg_header:
                 for item in seg_header.SegmentSequence:
                     seg_num = item.SegmentNumber - 1  # DICOM files start indexing from 1
-                    
+
                     if 'SegmentLabel' in item:
                         seg_label = item.SegmentLabel
                     elif 'SegmentDescription' in item:
@@ -50,10 +47,10 @@ class FilterSegmentsTransform(PipelinePart):
                         if label_pattern in seg_label:
                             target_segments.add(seg_num)
 
-            if len(target_segments) < self._min_num_segments:
-                continue
+            # Drop only out-of-range indices rather than the entire SEG file.
+            target_segments = {i for i in target_segments if i < seg_data.size(0)}
 
-            if seg_data.size(0) <= max(target_segments):
+            if len(target_segments) < self._min_num_segments:
                 continue
 
             seg_data = seg_data[list(target_segments)].sum(0, keepdim=True).clamp_(0, 1)
@@ -62,7 +59,8 @@ class FilterSegmentsTransform(PipelinePart):
         if len(new_seg_data_list) == 0:
             raise DataAnomalyError('No correct segmentation could be found.')
 
-        return (ct_data, new_seg_data_list), params
+        data['seg_list'] = new_seg_data_list
+        return data, params
 
 
 class ClipAndNormTransform(PipelinePart):
@@ -70,71 +68,76 @@ class ClipAndNormTransform(PipelinePart):
         self.clip_min = clip_min
         self.clip_max = clip_max
 
-    def __call__(self, *data, **params):
-        ct_data, seg_data_list = data
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        ct_data = data.get('ct')
 
         if ct_data is not None:
             ct_data.clip_(self.clip_min, self.clip_max)
 
             ct_data_min = ct_data.min()
             ct_data_max = ct_data.max()
-            ct_data = (ct_data - ct_data_min) / (ct_data_max - ct_data_min)
+            denom = ct_data_max - ct_data_min
+            if denom == 0:
+                ct_data = torch.zeros_like(ct_data)
+            else:
+                ct_data = (ct_data - ct_data_min) / denom
 
-        return (ct_data, seg_data_list), params
+            data['ct'] = ct_data
+
+        return data, params
 
 
 class OrientTransform(PipelinePart):
     def __init__(self, orientation='RAS'):
         self._backend = mt.Orientation(axcodes=orientation, labels=None)
 
-    def __call__(self, *data, **params):
-        ct_data, seg_data_list = data
-        if ct_data is not None:
-            ct_data = self._backend(ct_data)
-        if seg_data_list is not None:
-            seg_data_list = [self._backend(seg_data) for seg_data in seg_data_list]
-        return (ct_data, seg_data_list), params
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        if data.get('ct') is not None:
+            data['ct'] = self._backend(data['ct'])
+        if data.get('seg_list') is not None:
+            data['seg_list'] = [self._backend(s) for s in data['seg_list']]
+        return data, params
 
 
 class ResampleTransform(PipelinePart):
     def __init__(self, spacing=(1., 1., 1.), ct_mode='bilinear', seg_mode='nearest'):
-        self._ct_backend = mt.Spacing(pixdim=spacing, mode=ct_mode)
+        self._ct_backend  = mt.Spacing(pixdim=spacing, mode=ct_mode)
         self._seg_backend = mt.ResampleToMatch(mode=seg_mode, padding_mode='zeros')
 
-    def __call__(self, *data, **params):
-        ct_data, seg_data_list = data
-        if ct_data is not None:
-            ct_data = self._ct_backend(ct_data)
-        if seg_data_list is not None:
-            seg_data_list = [self._seg_backend(seg_data, ct_data) for seg_data in seg_data_list]
-        return (ct_data, seg_data_list), params
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        if data.get('ct') is not None:
+            data['ct'] = self._ct_backend(data['ct'])
+        if data.get('seg_list') is not None:
+            data['seg_list'] = [self._seg_backend(s, data['ct']) for s in data['seg_list']]
+        return data, params
 
 
 class MergeSegmentsTransform(PipelinePart):
-    def __call__(self, *data, **params):
-        ct_data, seg_data_list = data
-        
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        seg_data_list = data.pop('seg_list', None)
+
         if not seg_data_list:
-            return (ct_data, None), params
+            data['seg'] = None
+            return data, params
 
-        # If there is only one SEG (like in NSCLC), just return it
+        # If there is only one SEG (like in NSCLC), just use it directly
         if len(seg_data_list) == 1:
-            return (ct_data, seg_data_list), params
+            data['seg'] = seg_data_list[0]
+        else:
+            data['seg'] = torch.stack(seg_data_list, dim=0).sum(dim=0).clamp_(0, 1)
 
-        seg_data_list = [torch.stack(seg_data_list, dim=0).sum(dim=0).clamp_(0, 1)]
-
-        return (ct_data, seg_data_list), params
+        return data, params
 
 
 class ToDeviceTransform(PipelinePart):
     def __init__(self, device='cpu'):
         self._device = torch.device(device)
 
-    def __call__(self, *data, **params):
-        ct_data, seg_data_list = data
-        if ct_data is not None:
-            ct_data = ct_data.to(self._device)
-        if seg_data_list is not None:
-            seg_data_list = [seg_data.to(self._device) for seg_data in seg_data_list]
-        return (ct_data, seg_data_list), params
-
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        if data.get('ct') is not None:
+            data['ct'] = data['ct'].to(self._device)
+        if data.get('seg_list') is not None:
+            data['seg_list'] = [s.to(self._device) for s in data['seg_list']]
+        if data.get('seg') is not None:
+            data['seg'] = data['seg'].to(self._device)
+        return data, params

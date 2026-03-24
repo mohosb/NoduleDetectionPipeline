@@ -9,7 +9,9 @@ class SmartTemporaryDirectory(tempfile.TemporaryDirectory):
 
         temp_dir_candidates = dir
         if temp_dir_candidates is None:
-            temp_dir_candidates = ['/dev/shm', tempfile.gettempdir(), os.getcwd()]
+            import platform
+            shm = ['/dev/shm'] if platform.system() == 'Linux' else []
+            temp_dir_candidates = shm + [tempfile.gettempdir(), os.getcwd()]
 
         temp_dir = None
         for candidate in temp_dir_candidates:
