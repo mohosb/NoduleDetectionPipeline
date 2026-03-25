@@ -1,18 +1,33 @@
 #!/usr/bin/env bash
 # Run the full processing pipeline across all datasets, modes, and save modes.
 #
-# Flags used:
-#   --sync         Download / update raw data before processing
-#   --no-compress  Save uncompressed NPZ files
-#   --cpu          Force CPU-only execution
+# Usage:
+#   ./run_all.sh [--sync] [--cpu]
 #
-# Edit CPU_FLAG below to switch to GPU workers (e.g. remove it or set --workers N).
+#   --sync   Download / update raw data before each run (default: off)
+#   --cpu    Force CPU-only single-process execution (default: off, uses available GPUs)
+#
+# Examples:
+#   ./run_all.sh                 # GPU, no re-download
+#   ./run_all.sh --cpu           # CPU, no re-download
+#   ./run_all.sh --sync          # GPU, sync data first
+#   ./run_all.sh --sync --cpu    # CPU, sync data first
 
 set -euo pipefail
 
 PYTHON="${PYTHON:-python}"
 SCRIPT="process.py"
-CPU_FLAG="--cpu"  # remove or replace with "--workers N" for GPU machines
+
+# --- Parse flags ---
+SYNC_FLAG=""
+CPU_FLAG=""
+for arg in "$@"; do
+    case "$arg" in
+        --sync) SYNC_FLAG="--sync" ;;
+        --cpu)  CPU_FLAG="--cpu"   ;;
+        *) echo "Unknown argument: $arg"; exit 1 ;;
+    esac
+done
 
 run() {
     local dataset="$1"
@@ -26,8 +41,8 @@ run() {
         --dataset    "$dataset"   \
         --mode       "$mode"      \
         --save-mode  "$save_mode" \
-        --sync                    \
         --no-compress             \
+        $SYNC_FLAG                \
         $CPU_FLAG
 }
 
