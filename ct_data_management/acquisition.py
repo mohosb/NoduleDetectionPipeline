@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from idc_index import index
+import logging
 import pandas as pd
 import os
 import warnings
@@ -7,6 +8,8 @@ import pydicom
 import shutil
 from tqdm import tqdm
 from glob import glob
+
+_logger = logging.getLogger('pipeline')
 
 
 @dataclass(frozen=True)
@@ -74,15 +77,15 @@ class IDCFileSystemDataManager:
             seg_paths = [os.path.join(seg_dir, seg_id) for seg_id in seg_ids]
 
             if not os.path.isdir(ct_path):
-                print(f'Warning: CT directory missing, skipping: {ct_path}')
+                _logger.warning('CT directory missing, skipping: %s', ct_path)
                 continue
 
             valid_seg_paths = [p for p in seg_paths if os.path.isdir(p)]
             n_missing = len(seg_paths) - len(valid_seg_paths)
             if n_missing:
-                print(f'Warning: {n_missing} SEG director(ies) missing for CT {ct_id}.')
+                _logger.warning('%d SEG director(ies) missing for CT %s.', n_missing, ct_id)
             if not valid_seg_paths:
-                print(f'No valid SEG directories remain for CT {ct_id}, skipping.')
+                _logger.warning('No valid SEG directories remain for CT %s, skipping.', ct_id)
                 continue
 
             yield ct_path, valid_seg_paths
@@ -92,7 +95,7 @@ class IDCFileSystemDataManager:
     def _download_segmentations(self):
         client = self._make_client()
 
-        print('Querying IDC for SEG series...')
+        _logger.info('Querying IDC for SEG series...')
         seg_ids = client.sql_query(f'''
             SELECT SeriesInstanceUID
             FROM   index
@@ -101,7 +104,7 @@ class IDCFileSystemDataManager:
               AND  {self._data_info.seg_query_conditions}
         ''')['SeriesInstanceUID'].tolist()
 
-        print(f'Downloading {len(seg_ids)} SEG series...')
+        _logger.info('Downloading %d SEG series...', len(seg_ids))
         seg_dir = os.path.join(self._data_path, 'seg')
         os.makedirs(seg_dir, exist_ok=True)
         client.download_dicom_series(
@@ -127,7 +130,7 @@ class IDCFileSystemDataManager:
             if os.path.isdir(os.path.join(seg_dir, d))
         ])
 
-        print('Building manifest from SEG DICOM headers...')
+        _logger.info('Building manifest from SEG DICOM headers...')
         new_pairs = []
         for series_path in tqdm(seg_series_dirs):
             seg_id = os.path.basename(series_path)
@@ -136,15 +139,15 @@ class IDCFileSystemDataManager:
 
             dcm_files = glob(os.path.join(series_path, '*.dcm'))
             if not dcm_files:
-                print(f'No DICOM files in {series_path}, skipping.')
+                _logger.warning('No DICOM files in %s, skipping.', series_path)
                 continue
 
             seg_metadata = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
             try:
                 ct_id = str(seg_metadata.ReferencedSeriesSequence[0].SeriesInstanceUID)
             except (AttributeError, IndexError) as e:
-                print(f'Metadata extraction failed for {series_path}: {type(e).__name__}')
-                print(f'Removing defective SEG series: {series_path}')
+                _logger.error('Metadata extraction failed for %s: %s', series_path, type(e).__name__)
+                _logger.error('Removing defective SEG series: %s', series_path)
                 shutil.rmtree(series_path)
                 continue
 
@@ -153,9 +156,9 @@ class IDCFileSystemDataManager:
         if new_pairs:
             updated = pd.concat([existing, pd.DataFrame(new_pairs)], ignore_index=True)
             updated.to_csv(manifest_path, index=False)
-            print(f'Manifest updated with {len(new_pairs)} new entries → {manifest_path}')
+            _logger.info('Manifest updated with %d new entries → %s', len(new_pairs), manifest_path)
         else:
-            print('Manifest is already up to date.')
+            _logger.info('Manifest is already up to date.')
 
     def _download_ct(self):
         manifest = self._load_manifest()
@@ -166,10 +169,10 @@ class IDCFileSystemDataManager:
 
         missing_ct_ids = [ct for ct in all_ct_ids if not os.path.isdir(os.path.join(ct_dir, ct))]
         if not missing_ct_ids:
-            print('All CT series already present on disk.')
+            _logger.info('All CT series already present on disk.')
             return
 
-        print(f'Downloading {len(missing_ct_ids)}/{len(all_ct_ids)} CT series...')
+        _logger.info('Downloading %d/%d CT series...', len(missing_ct_ids), len(all_ct_ids))
         client = self._make_client()
         client.download_dicom_series(
             seriesInstanceUID=missing_ct_ids,

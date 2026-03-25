@@ -13,6 +13,7 @@ Usage:
     python process.py --dataset lidc_idri       --mode nodule --save-mode 2d  # save per-slice
     python process.py --dataset lidc_idri       --mode nodule --workers 4     # use 4 GPU workers
     python process.py --dataset lidc_idri       --mode nodule --cpu           # force CPU single-process
+    python process.py --dataset lidc_idri       --mode nodule --view          # interactive viewer instead of saving
 '''
 
 import argparse
@@ -114,7 +115,7 @@ def _process_series(args):
 
 def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
                    seg_subdir: str, save_mode: str = '3d', compress: bool = True,
-                   device: str = 'cpu'):
+                   device: str = 'cpu', viewer: bool = False):
     ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
     seg_dir = os.path.join(save_path, f'{seg_subdir}_{save_mode}')
 
@@ -135,8 +136,10 @@ def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
     if device != 'cpu':
         parts.append(ToDeviceTransform(device='cpu'))
 
-    parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
-    #parts.append(InteractiveViewer())
+    if viewer:
+        parts.append(InteractiveViewer())
+    else:
+        parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
 
     return PipelineStack(parts)
 
@@ -160,14 +163,15 @@ def setup_logging(log_dir: str, dataset: str, mode: str, log_queue=None):
 
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(logging.Formatter('%(asctime)s  %(levelname)s  %(message)s'))
+    fh.setFormatter(logging.Formatter('%(asctime)s  %(levelname)-8s %(message)s'))
 
     ch = _TqdmLoggingHandler()
     ch.setLevel(logging.INFO)
-    ch.setFormatter(logging.Formatter('%(levelname)s  %(message)s'))
+    ch.setFormatter(logging.Formatter('%(levelname)-8s %(message)s'))
 
     logger = logging.getLogger('pipeline')
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False  # prevent records reaching the root logger's handlers (e.g. installed by torch/monai)
     logger.addHandler(fh)
     logger.addHandler(ch)
     logger.info(f'Logging to {log_file}')
@@ -215,6 +219,8 @@ def main():
                         help='Number of worker processes. Default: number of available GPUs (or 1 if none).')
     parser.add_argument('--cpu',         action='store_true',
                         help='Force CPU-only execution regardless of GPU availability. Implies --workers 1.')
+    parser.add_argument('--view',        action='store_true',
+                        help='Open interactive viewer instead of saving NPZ files. Implies --cpu.')
     args = parser.parse_args()
 
     dataset = args.dataset
@@ -230,7 +236,7 @@ def main():
     log_dir   = os.path.join(save_path, 'logs')
 
     # Determine GPU count and effective worker count.
-    if args.cpu:
+    if args.cpu or args.view:
         n_gpus    = 0
         n_workers = 1
     else:
@@ -252,6 +258,7 @@ def main():
         seg_subdir=seg_subdir,
         save_mode=args.save_mode,
         compress=args.compress,
+        viewer=args.view,
     )
 
     if n_workers > 1:

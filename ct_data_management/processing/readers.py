@@ -1,12 +1,17 @@
+import sys
+import logging
 import torch
 import monai.transforms as mt
 import subprocess
 import os
 import pydicom
-import shutil
 from glob import glob
 from .pipeline import PipelinePart
 from ..utils import SmartTemporaryDirectory
+
+_logger = logging.getLogger('pipeline')
+
+_SEG2NII = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'seg2nii.py')
 
 
 class DICOMFileSystemReader(PipelinePart):
@@ -22,7 +27,7 @@ class DICOMFileSystemReader(PipelinePart):
             if self._return_headers:
                 params['ct_header'] = pydicom.dcmread(self._find_dicom(ct_path), stop_before_pixels=True)
                 #params['ct_id'] = ct_path.split('/')[-1]
-            data['ct'] = self._read_dicom(ct_path)
+            data['ct'] = self._read_ct_dicom(ct_path)
 
         if seg_path_list is not None:
             if self._return_headers:
@@ -31,7 +36,7 @@ class DICOMFileSystemReader(PipelinePart):
                     for p in seg_path_list
                 ]
                 #params['seg_id'] = seg_path.split('/')[-1]
-            data['seg_list'] = [self._read_dicom(p) for p in seg_path_list]
+            data['seg_list'] = [self._read_seg_dicom(p) for p in seg_path_list]
 
         return data, params
 
@@ -43,7 +48,7 @@ class DICOMFileSystemReader(PipelinePart):
             raise FileNotFoundError(f'No DICOM files found in: {path}')
         return dcm_files[0]
 
-    def _read_dicom(self, path):
+    def _read_ct_dicom(self, path):
         # Use the actual size of the DICOM files as the space estimate for the
         # temporary NIfTI conversion, not the filesystem-wide usage figure.
         required_space = sum(
@@ -64,24 +69,59 @@ class DICOMFileSystemReader(PipelinePart):
             data = self._backend(nii_path)
         return data
 
-    '''
     def _read_seg_dicom(self, path):
-        required_space = shutil.disk_usage(path)[1] / 1024 ** 3
-        with SmartTemporaryDirectory(required_space) as temp_dir:
-            subprocess.run(
-                [
-                    'segimage2itkimage',
-                    '--inputDICOM', glob(os.path.join(path, '*.dcm'))[0],
-                    '--outputDirectory', temp_dir,
-                    '--outputType', 'nifti'
-                ],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE
-            )
-            data = self._backend(glob(os.path.join(temp_dir, '*.nii.gz')))
-        return data
-    '''
+        # Estimate output NIfTI size from the DICOM header — not from the DICOM file
+        # size — because BINARY SEG stores 1 bit/pixel but we write float32 (4 bytes/pixel),
+        # giving up to a 32× expansion. Using the file size would cause SmartTemporaryDirectory
+        # to pick a location with far too little free space.
+        dcm_files = sorted(glob(os.path.join(path, '*.dcm')), key=os.path.getsize, reverse=True)
+        if not dcm_files:
+            raise FileNotFoundError(f'No DICOM files found in: {path}')
+        hdr        = pydicom.dcmread(dcm_files[0], stop_before_pixels=True)
+        n_segs     = len(hdr.SegmentSequence) if hasattr(hdr, 'SegmentSequence') else 1
+        n_frames   = int(getattr(hdr, 'NumberOfFrames', n_segs))
+        rows, cols = int(hdr.Rows), int(hdr.Columns)
+        # Upper bound: n_segs NIfTI files, each up to n_frames × rows × cols float32 voxels.
+        required_space = n_segs * n_frames * rows * cols * 4
 
-class PAXReader(PipelinePart):
+        with SmartTemporaryDirectory(required_space) as temp_dir:
+            try:
+                result = subprocess.run(
+                    [sys.executable, _SEG2NII, '-z', 'n', '-o', temp_dir, '-f', '_temp_seg2nii_file', str(path)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr_text = e.stderr.decode(errors='replace').strip() if e.stderr else '(no output)'
+                raise RuntimeError(
+                    f'seg2nii failed for {os.path.basename(path)}: {stderr_text}'
+                ) from None
+            # Route seg2nii stderr to the appropriate Python log level.
+            # INFO: lines → DEBUG (file only, not console); WARNING: lines → WARNING.
+            if result.stderr:
+                series = os.path.basename(path)
+                for line in result.stderr.decode(errors='replace').splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith('WARNING:'):
+                        _logger.warning('seg2nii [%s]: %s', series, line[8:].strip())
+                    else:
+                        # INFO: lines and anything else → debug (written to log file only)
+                        _logger.debug('seg2nii [%s]: %s', series, line)
+            nii_files = sorted(glob(os.path.join(temp_dir, '_temp_seg2nii_file*.nii')))
+            if not nii_files:
+                raise FileNotFoundError(
+                    f'seg2nii exited successfully but produced no output for: {path}'
+                )
+            if len(nii_files) == 1:
+                data = self._backend(nii_files[0])
+            else:
+                # Multi-segment SEG: stack all segments along the channel axis → (N, H, W, D)
+                data = torch.cat([self._backend(f) for f in nii_files], dim=0)
+        return data
+
+
+class PACSReader(PipelinePart):
     pass
