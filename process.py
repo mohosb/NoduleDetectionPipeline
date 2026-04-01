@@ -15,6 +15,8 @@ Usage:
     python process.py --dataset lidc_idri       --mode nodule --cpu           # force CPU single-process
     python process.py --dataset lidc_idri       --mode nodule --view          # interactive viewer instead of saving
     python process.py --dataset lidc_idri       --mode nodule --label-type instance  # instance segmentation masks
+    python process.py --dataset lidc_idri       --mode nodule --save-format nifti    # save as NIfTI instead of NumPy
+    python process.py --dataset lidc_idri       --mode nodule --save-format nifti --no-compress  # uncompressed .nii
 '''
 
 import argparse
@@ -47,7 +49,7 @@ from ct_data_management.processing.transforms import (
     ToDeviceTransform,
     NoduleInstanceSegTransform,
 )
-from ct_data_management.processing.writers import NPZWriter
+from ct_data_management.processing.writers import NPZWriter, NIfTIWriter
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
 
@@ -116,8 +118,8 @@ def _process_series(args):
 # --- Pipeline builder ---
 
 def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
-                   seg_subdir: str, save_mode: str = '3d', compress: bool = True,
-                   device: str = 'cpu', viewer: bool = False,
+                   seg_subdir: str, save_mode: str = '3d', save_format: str = 'numpy',
+                   compress: bool = True, device: str = 'cpu', viewer: bool = False,
                    label_type: str = 'semantic'):
     ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
     seg_dir = os.path.join(save_path, f'{seg_subdir}_{save_mode}')
@@ -144,6 +146,8 @@ def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
 
     if viewer:
         parts.append(InteractiveViewer())
+    elif save_format == 'nifti':
+        parts.append(NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
     else:
         parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
 
@@ -192,15 +196,20 @@ def setup_logging(log_dir: str, dataset: str, mode: str, log_queue=None):
 
 # --- Helpers ---
 
-def already_processed(save_path: str, seg_subdir: str, series_id: str, save_mode: str) -> bool:
+def already_processed(save_path: str, seg_subdir: str, series_id: str,
+                      save_mode: str, save_format: str, compress: bool) -> bool:
     ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
     seg_dir = os.path.join(save_path, f'{seg_subdir}_{save_mode}')
+    if save_format == 'nifti':
+        ext = '.nii.gz' if compress else '.nii'
+    else:
+        ext = '.npz'
     if save_mode == '3d':
-        return (os.path.exists(os.path.join(ct_dir,  series_id + '.npz')) and
-                os.path.exists(os.path.join(seg_dir, series_id + '.npz')))
+        return (os.path.exists(os.path.join(ct_dir,  series_id + ext)) and
+                os.path.exists(os.path.join(seg_dir, series_id + ext)))
     else:  # '2d' — check for the first slice of each series
-        return (os.path.exists(os.path.join(ct_dir,  f'{series_id}_0000.npz')) and
-                os.path.exists(os.path.join(seg_dir, f'{series_id}_0000.npz')))
+        return (os.path.exists(os.path.join(ct_dir,  f'{series_id}_0000{ext}')) and
+                os.path.exists(os.path.join(seg_dir, f'{series_id}_0000{ext}')))
 
 
 # --- Entry point ---
@@ -218,9 +227,14 @@ def main():
     parser.add_argument('--reprocess',   action='store_true',
                         help='Re-process series that already have output files.')
     parser.add_argument('--save-mode',   default='3d', choices=['3d', '2d'], dest='save_mode',
-                        help='3d: one NPZ per volume (default). 2d: one NPZ per axial slice.')
+                        help='3d: one file per volume (default). 2d: one file per axial slice.')
+    parser.add_argument('--save-format', default='numpy', choices=['numpy', 'nifti'],
+                        dest='save_format',
+                        help='numpy: save as NPZ files (default). '
+                             'nifti: save as NIfTI files.')
     parser.add_argument('--no-compress', action='store_false', dest='compress',
-                        help='Save uncompressed NPZ files (faster writes, larger files).')
+                        help='Save uncompressed files (faster writes, larger files). '
+                             'Produces .npz for numpy format and .nii for nifti format.')
     parser.add_argument('--workers',     type=int, default=None,
                         help='Number of worker processes. Default: number of available GPUs (or 1 if none).')
     parser.add_argument('--cpu',         action='store_true',
@@ -270,6 +284,7 @@ def main():
         min_num_segments=min_num_segments,
         seg_subdir=seg_subdir,
         save_mode=args.save_mode,
+        save_format=args.save_format,
         compress=args.compress,
         viewer=args.view,
         label_type=args.label_type,
@@ -282,7 +297,7 @@ def main():
     else:
         logger, _ = setup_logging(log_dir, dataset, mode)
 
-    logger.info(f'Dataset:   {dataset}  Mode: {mode}  Save mode: {args.save_mode}')
+    logger.info(f'Dataset:   {dataset}  Mode: {mode}  Save mode: {args.save_mode}  Save format: {args.save_format}')
     logger.info(f'Raw path:  {raw_path}')
     logger.info(f'Save path: {save_path}')
     logger.info(f'Workers:   {n_workers}  GPUs: {n_gpus}')
@@ -303,7 +318,8 @@ def main():
         tasks = [
             (ct_path, seg_path_list)
             for ct_path, seg_path_list in all_paths
-            if not already_processed(save_path, seg_subdir, os.path.basename(ct_path), args.save_mode)
+            if not already_processed(save_path, seg_subdir, os.path.basename(ct_path),
+                                     args.save_mode, args.save_format, args.compress)
         ]
         n_skipped = n_total - len(tasks)
     else:
