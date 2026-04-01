@@ -14,6 +14,7 @@ Usage:
     python process.py --dataset lidc_idri       --mode nodule --workers 4     # use 4 GPU workers
     python process.py --dataset lidc_idri       --mode nodule --cpu           # force CPU single-process
     python process.py --dataset lidc_idri       --mode nodule --view          # interactive viewer instead of saving
+    python process.py --dataset lidc_idri       --mode nodule --label-type instance  # instance segmentation masks
 '''
 
 import argparse
@@ -44,6 +45,7 @@ from ct_data_management.processing.transforms import (
     MergeSegmentsTransform,
     ClipAndNormTransform,
     ToDeviceTransform,
+    NoduleInstanceSegTransform,
 )
 from ct_data_management.processing.writers import NPZWriter
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
@@ -115,7 +117,8 @@ def _process_series(args):
 
 def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
                    seg_subdir: str, save_mode: str = '3d', compress: bool = True,
-                   device: str = 'cpu', viewer: bool = False):
+                   device: str = 'cpu', viewer: bool = False,
+                   label_type: str = 'semantic'):
     ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
     seg_dir = os.path.join(save_path, f'{seg_subdir}_{save_mode}')
 
@@ -132,6 +135,9 @@ def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
         MergeSegmentsTransform(),
         ClipAndNormTransform(clip_min=-1000, clip_max=400),
     ]
+
+    if label_type == 'instance':
+        parts.append(NoduleInstanceSegTransform())
 
     if device != 'cpu':
         parts.append(ToDeviceTransform(device='cpu'))
@@ -221,10 +227,17 @@ def main():
                         help='Force CPU-only execution regardless of GPU availability. Implies --workers 1.')
     parser.add_argument('--view',        action='store_true',
                         help='Open interactive viewer instead of saving NPZ files. Implies --cpu.')
+    parser.add_argument('--label-type',  default='semantic', choices=['semantic', 'instance'],
+                        dest='label_type',
+                        help='Label type for the nodule segmentation mask: "semantic" (binary, default) '
+                             'or "instance" (connected-component IDs). Only valid with --mode nodule.')
     args = parser.parse_args()
 
     dataset = args.dataset
     mode    = args.mode
+
+    if args.label_type == 'instance' and mode != 'nodule':
+        parser.error('--label-type instance is only valid with --mode nodule.')
 
     if dataset not in MODE_CONFIGS.get(mode, {}):
         parser.error(f'Mode "{mode}" is not defined for dataset "{dataset}".')
@@ -259,6 +272,7 @@ def main():
         save_mode=args.save_mode,
         compress=args.compress,
         viewer=args.view,
+        label_type=args.label_type,
     )
 
     if n_workers > 1:

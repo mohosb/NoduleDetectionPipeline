@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 import monai.transforms as mt
+import scipy.ndimage as ndi
+from monai.data import MetaTensor
 from .pipeline import PipelinePart
 
 
@@ -140,4 +142,36 @@ class ToDeviceTransform(PipelinePart):
             data['seg_list'] = [s.to(self._device) for s in data['seg_list']]
         if data.get('seg') is not None:
             data['seg'] = data['seg'].to(self._device)
+        return data, params
+
+
+class NoduleInstanceSegTransform(PipelinePart):
+    """Convert a binary nodule segmentation mask into an instance segmentation mask.
+
+    Runs 3D connected-component analysis (26-connectivity) on ``data['seg']``
+    so that each spatially distinct nodule receives a unique positive integer
+    label. Background remains 0.  Two voxels that touch — even diagonally —
+    are treated as belonging to the same nodule, matching the assumption that
+    touching nodules in 3D CT are a single lesion.
+
+    Must be placed after MergeSegmentsTransform (which produces ``data['seg']``).
+    """
+
+    # Full 26-connectivity in 3D: every face, edge, and corner neighbour.
+    _STRUCTURE = ndi.generate_binary_structure(3, 3)
+
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        seg = data.get('seg')
+        if seg is None:
+            return data, params
+
+        # seg shape: (1, D, H, W); extract the single channel as a bool array.
+        mask_np = seg[0].cpu().numpy().astype(bool)
+
+        labeled_np, _ = ndi.label(mask_np, structure=self._STRUCTURE)
+
+        # int16 supports up to 32 767 instances per volume, which is ample.
+        labeled_tensor = torch.from_numpy(labeled_np).unsqueeze(0).to(torch.int16)
+        data['seg'] = MetaTensor(labeled_tensor, meta=seg.meta)
+
         return data, params
