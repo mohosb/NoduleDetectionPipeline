@@ -10,12 +10,15 @@ Usage:
     python process.py --dataset lidc_idri       --mode nodule --sync          # also downloads data
     python process.py --dataset lidc_idri       --mode nodule --download-only # download raw data only, skip processing
     python process.py --dataset lidc_idri       --mode nodule --reprocess     # ignore already-processed entries
-    python process.py --dataset lidc_idri       --mode nodule --save-mode 2d  # save per-slice
-    python process.py --dataset lidc_idri       --mode nodule --workers 4     # use 4 GPU workers
-    python process.py --dataset lidc_idri       --mode nodule --cpu           # force CPU single-process
-    python process.py --dataset lidc_idri       --mode nodule --view          # interactive viewer instead of saving
-    python process.py --dataset lidc_idri       --mode nodule --label-type instance  # instance segmentation masks
-    python process.py --dataset lidc_idri       --mode nodule --save-format nifti    # save as NIfTI instead of NumPy
+    python process.py --dataset lidc_idri       --mode nodule --save-mode 2d           # save per-slice
+    python process.py --dataset lidc_idri       --mode nodule --save-mode 3d,2d        # save both 3D and per-slice
+    python process.py --dataset lidc_idri       --mode nodule --workers 4              # use 4 GPU workers
+    python process.py --dataset lidc_idri       --mode nodule --cpu                    # force CPU single-process
+    python process.py --dataset lidc_idri       --mode nodule --view                   # interactive viewer instead of saving
+    python process.py --dataset lidc_idri       --mode nodule --label-type instance              # instance segmentation masks
+    python process.py --dataset lidc_idri       --mode nodule --label-type semantic,instance     # both semantic and instance masks
+    python process.py --dataset lidc_idri       --mode nodule --save-format nifti      # save as NIfTI instead of NumPy
+    python process.py --dataset lidc_idri       --mode nodule --save-format numpy,nifti  # save as both NumPy and NIfTI
     python process.py --dataset lidc_idri       --mode nodule --save-format nifti --no-compress  # uncompressed .nii
 '''
 
@@ -63,16 +66,19 @@ DATASET_CONFIGS = {
     'nlst_labeled':    NLST_LABELED_INFO,
 }
 
-# Per-mode configuration: (target_labels, min_num_segments, seg_save_subdir)
+# Per-mode configuration: (target_labels, min_num_segments, seg_base)
+# seg_base is used to construct output directory names:
+#   semantic  → {seg_base}_sem_seg_{save_mode}   (e.g. nodule_sem_seg_3d)
+#   instance  → {seg_base}_inst_seg_{save_mode}  (e.g. nodule_inst_seg_3d)
 MODE_CONFIGS = {
     'nodule': {
-        'lidc_idri':       (['nodule'],           1, 'nodule_seg'),
-        'nsclc_radiomics': (['neoplasm'],         1, 'nodule_seg'),
-        'nlst_labeled':    (['nodule'],           1, 'nodule_seg'),
+        'lidc_idri':       (['nodule'],           1, 'nodule'),
+        'nsclc_radiomics': (['neoplasm'],         1, 'nodule'),
+        'nlst_labeled':    (['nodule'],           1, 'nodule'),
     },
     'roi': {
-        'nsclc_radiomics': (['lung', 'neoplasm'], 2, 'roi_seg'),
-        'nlst_labeled':    (['lung', 'nodule'],   2, 'roi_seg'),
+        'nsclc_radiomics': (['lung', 'neoplasm'], 2, 'roi'),
+        'nlst_labeled':    (['lung', 'nodule'],   2, 'roi'),
     },
 }
 
@@ -118,11 +124,15 @@ def _process_series(args):
 # --- Pipeline builder ---
 
 def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
-                   seg_subdir: str, save_mode: str = '3d', save_format: str = 'numpy',
+                   seg_base: str, save_modes: list = None, save_formats: list = None,
                    compress: bool = True, device: str = 'cpu', viewer: bool = False,
-                   label_type: str = 'semantic'):
-    ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
-    seg_dir = os.path.join(save_path, f'{seg_subdir}_{save_mode}')
+                   label_types: list = None):
+    if save_modes is None:
+        save_modes = ['3d']
+    if save_formats is None:
+        save_formats = ['numpy']
+    if label_types is None:
+        label_types = ['semantic']
 
     parts = [DICOMFileSystemReader(return_headers=True, dtype=torch.float16)]
 
@@ -138,18 +148,37 @@ def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
         ClipAndNormTransform(clip_min=-1000, clip_max=400),
     ]
 
-    if label_type == 'instance':
-        parts.append(NoduleInstanceSegTransform())
-
     if device != 'cpu':
         parts.append(ToDeviceTransform(device='cpu'))
 
     if viewer:
         parts.append(InteractiveViewer())
-    elif save_format == 'nifti':
-        parts.append(NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
-    else:
-        parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
+        return PipelineStack(parts)
+
+    has_semantic = 'semantic' in label_types
+    has_instance = 'instance' in label_types
+
+    if has_semantic:
+        for save_mode in save_modes:
+            ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
+            seg_dir = os.path.join(save_path, f'{seg_base}_sem_seg_{save_mode}')
+            for save_format in save_formats:
+                if save_format == 'nifti':
+                    parts.append(NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
+                else:
+                    parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
+
+    if has_instance:
+        parts.append(NoduleInstanceSegTransform())
+        for save_mode in save_modes:
+            # CT already written by semantic writers; skip it to avoid redundant I/O.
+            ct_dir  = None if has_semantic else os.path.join(save_path, f'ct_{save_mode}')
+            seg_dir = os.path.join(save_path, f'{seg_base}_inst_seg_{save_mode}')
+            for save_format in save_formats:
+                if save_format == 'nifti':
+                    parts.append(NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
+                else:
+                    parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
 
     return PipelineStack(parts)
 
@@ -196,20 +225,25 @@ def setup_logging(log_dir: str, dataset: str, mode: str, log_queue=None):
 
 # --- Helpers ---
 
-def already_processed(save_path: str, seg_subdir: str, series_id: str,
-                      save_mode: str, save_format: str, compress: bool) -> bool:
-    ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
-    seg_dir = os.path.join(save_path, f'{seg_subdir}_{save_mode}')
-    if save_format == 'nifti':
-        ext = '.nii.gz' if compress else '.nii'
-    else:
-        ext = '.npz'
-    if save_mode == '3d':
-        return (os.path.exists(os.path.join(ct_dir,  series_id + ext)) and
-                os.path.exists(os.path.join(seg_dir, series_id + ext)))
-    else:  # '2d' — check for the first slice of each series
-        return (os.path.exists(os.path.join(ct_dir,  f'{series_id}_0000{ext}')) and
-                os.path.exists(os.path.join(seg_dir, f'{series_id}_0000{ext}')))
+def already_processed(save_path: str, seg_base: str, series_id: str,
+                      save_modes: list, save_formats: list, label_types: list,
+                      compress: bool) -> bool:
+    for save_mode in save_modes:
+        ct_dir = os.path.join(save_path, f'ct_{save_mode}')
+        for save_format in save_formats:
+            ext = '.nii.gz' if (save_format == 'nifti' and compress) else \
+                  '.nii'    if  save_format == 'nifti'               else '.npz'
+            stem = series_id if save_mode == '3d' else f'{series_id}_0000'
+            # CT is shared across label types; check it once per (save_mode, save_format).
+            if not os.path.exists(os.path.join(ct_dir, stem + ext)):
+                return False
+            # Seg is label-type-specific.
+            for label_type in label_types:
+                suffix  = 'sem' if label_type == 'semantic' else 'inst'
+                seg_dir = os.path.join(save_path, f'{seg_base}_{suffix}_seg_{save_mode}')
+                if not os.path.exists(os.path.join(seg_dir, stem + ext)):
+                    return False
+    return True
 
 
 # --- Entry point ---
@@ -226,12 +260,10 @@ def main():
                         help='Download / update raw data and exit without processing. Implies --sync.')
     parser.add_argument('--reprocess',   action='store_true',
                         help='Re-process series that already have output files.')
-    parser.add_argument('--save-mode',   default='3d', choices=['3d', '2d'], dest='save_mode',
-                        help='3d: one file per volume (default). 2d: one file per axial slice.')
-    parser.add_argument('--save-format', default='numpy', choices=['numpy', 'nifti'],
-                        dest='save_format',
-                        help='numpy: save as NPZ files (default). '
-                             'nifti: save as NIfTI files.')
+    parser.add_argument('--save-mode',   default='3d', dest='save_mode',
+                        help='Comma-separated save modes: 3d, 2d, or 3d,2d. Default: 3d.')
+    parser.add_argument('--save-format', default='numpy', dest='save_format',
+                        help='Comma-separated save formats: numpy, nifti, or numpy,nifti. Default: numpy.')
     parser.add_argument('--no-compress', action='store_false', dest='compress',
                         help='Save uncompressed files (faster writes, larger files). '
                              'Produces .npz for numpy format and .nii for nifti format.')
@@ -241,22 +273,39 @@ def main():
                         help='Force CPU-only execution regardless of GPU availability. Implies --workers 1.')
     parser.add_argument('--view',        action='store_true',
                         help='Open interactive viewer instead of saving NPZ files. Implies --cpu.')
-    parser.add_argument('--label-type',  default='semantic', choices=['semantic', 'instance'],
-                        dest='label_type',
-                        help='Label type for the nodule segmentation mask: "semantic" (binary, default) '
-                             'or "instance" (connected-component IDs). Only valid with --mode nodule.')
+    parser.add_argument('--label-type',  default='semantic', dest='label_type',
+                        help='Comma-separated label types: semantic, instance, or semantic,instance. '
+                             'Default: semantic. instance is only valid with --mode nodule.')
     args = parser.parse_args()
+
+    VALID_SAVE_MODES   = {'3d', '2d'}
+    VALID_SAVE_FORMATS = {'numpy', 'nifti'}
+    VALID_LABEL_TYPES  = {'semantic', 'instance'}
+    save_modes   = [v.strip() for v in args.save_mode.split(',')]
+    save_formats = [v.strip() for v in args.save_format.split(',')]
+    label_types  = [v.strip() for v in args.label_type.split(',')]
+    invalid_modes        = [m for m in save_modes   if m not in VALID_SAVE_MODES]
+    invalid_formats      = [f for f in save_formats if f not in VALID_SAVE_FORMATS]
+    invalid_label_types  = [t for t in label_types  if t not in VALID_LABEL_TYPES]
+    if invalid_modes:
+        parser.error(f'Invalid --save-mode value(s): {invalid_modes}. Choose from {sorted(VALID_SAVE_MODES)}.')
+    if invalid_formats:
+        parser.error(f'Invalid --save-format value(s): {invalid_formats}. Choose from {sorted(VALID_SAVE_FORMATS)}.')
+    if invalid_label_types:
+        parser.error(f'Invalid --label-type value(s): {invalid_label_types}. Choose from {sorted(VALID_LABEL_TYPES)}.')
+    # Canonical order: semantic writers run before NoduleInstanceSegTransform.
+    label_types = sorted(set(label_types), key=lambda t: 0 if t == 'semantic' else 1)
 
     dataset = args.dataset
     mode    = args.mode
 
-    if args.label_type == 'instance' and mode != 'nodule':
+    if 'instance' in label_types and mode != 'nodule':
         parser.error('--label-type instance is only valid with --mode nodule.')
 
     if dataset not in MODE_CONFIGS.get(mode, {}):
         parser.error(f'Mode "{mode}" is not defined for dataset "{dataset}".')
 
-    target_labels, min_num_segments, seg_subdir = MODE_CONFIGS[mode][dataset]
+    target_labels, min_num_segments, seg_base = MODE_CONFIGS[mode][dataset]
 
     raw_path  = os.path.join(RAW_BASE,  dataset)
     save_path = os.path.join(PROC_BASE, dataset)
@@ -282,12 +331,12 @@ def main():
         save_path=save_path,
         target_labels=target_labels,
         min_num_segments=min_num_segments,
-        seg_subdir=seg_subdir,
-        save_mode=args.save_mode,
-        save_format=args.save_format,
+        seg_base=seg_base,
+        save_modes=save_modes,
+        save_formats=save_formats,
         compress=args.compress,
         viewer=args.view,
-        label_type=args.label_type,
+        label_types=label_types,
     )
 
     if n_workers > 1:
@@ -297,7 +346,7 @@ def main():
     else:
         logger, _ = setup_logging(log_dir, dataset, mode)
 
-    logger.info(f'Dataset:   {dataset}  Mode: {mode}  Save mode: {args.save_mode}  Save format: {args.save_format}')
+    logger.info(f'Dataset:   {dataset}  Mode: {mode}  Save modes: {save_modes}  Save formats: {save_formats}  Label types: {label_types}')
     logger.info(f'Raw path:  {raw_path}')
     logger.info(f'Save path: {save_path}')
     logger.info(f'Workers:   {n_workers}  GPUs: {n_gpus}')
@@ -318,8 +367,8 @@ def main():
         tasks = [
             (ct_path, seg_path_list)
             for ct_path, seg_path_list in all_paths
-            if not already_processed(save_path, seg_subdir, os.path.basename(ct_path),
-                                     args.save_mode, args.save_format, args.compress)
+            if not already_processed(save_path, seg_base, os.path.basename(ct_path),
+                                     save_modes, save_formats, label_types, args.compress)
         ]
         n_skipped = n_total - len(tasks)
     else:
