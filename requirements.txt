@@ -2,3 +2,5 @@ monai[all]
 pydicom
 dcm2niix
 idc-index
+pyyaml
+tomli; python_version < "3.11"

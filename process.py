@@ -1,25 +1,39 @@
 '''
 Unified processing entry point for all CT datasets.
 
+Driven by a YAML or TOML configuration file that specifies one or more runs.
+Each run is merged with optional shared defaults defined in the same file,
+which in turn fall back to built-in defaults for any unspecified field.
+
 Usage:
-    python process.py --dataset lidc_idri       --mode nodule
-    python process.py --dataset nsclc_radiomics --mode nodule
-    python process.py --dataset nsclc_radiomics --mode roi
-    python process.py --dataset nlst_labeled    --mode nodule
-    python process.py --dataset nlst_labeled    --mode roi
-    python process.py --dataset lidc_idri       --mode nodule --sync          # also downloads data
-    python process.py --dataset lidc_idri       --mode nodule --download-only # download raw data only, skip processing
-    python process.py --dataset lidc_idri       --mode nodule --reprocess     # ignore already-processed entries
-    python process.py --dataset lidc_idri       --mode nodule --save-mode 2d           # save per-slice
-    python process.py --dataset lidc_idri       --mode nodule --save-mode 3d,2d        # save both 3D and per-slice
-    python process.py --dataset lidc_idri       --mode nodule --workers 4              # use 4 GPU workers
-    python process.py --dataset lidc_idri       --mode nodule --cpu                    # force CPU single-process
-    python process.py --dataset lidc_idri       --mode nodule --view                   # interactive viewer instead of saving
-    python process.py --dataset lidc_idri       --mode nodule --label-type instance              # instance segmentation masks
-    python process.py --dataset lidc_idri       --mode nodule --label-type semantic,instance     # both semantic and instance masks
-    python process.py --dataset lidc_idri       --mode nodule --save-format nifti      # save as NIfTI instead of NumPy
-    python process.py --dataset lidc_idri       --mode nodule --save-format numpy,nifti  # save as both NumPy and NIfTI
-    python process.py --dataset lidc_idri       --mode nodule --save-format nifti --no-compress  # uncompressed .nii
+    python process.py configs/default.yaml
+    python process.py configs/default.toml
+    python process.py my_run.yaml
+
+Minimal config (YAML):
+    runs:
+      - dataset: lidc_idri
+        output:  nodule
+
+Full config with shared defaults and multiple runs (YAML):
+    defaults:
+      raw_data_path:  ../data/raw
+      save_format:    numpy
+      compress:       false
+      label_type:     instance
+      anomaly_filter: true
+
+    runs:
+      - dataset: lidc_idri
+        output:  nodule
+        nodule_save_mode: 3d
+
+      - dataset: nsclc_radiomics
+        output:        nodule,roi
+        nodule_save_mode: 3d
+        roi_save_mode: 2d
+
+See configs/ for full YAML and TOML examples with all available options documented.
 '''
 
 import argparse
@@ -47,8 +61,12 @@ from ct_data_management.processing.transforms import (
     FilterSegmentsTransform,
     OrientTransform,
     ResampleTransform,
+    LungDilationTransform,
+    ROICropTransform,
+    NoduleAnomalyFilterTransform,
     MergeSegmentsTransform,
-    ClipAndNormTransform,
+    HUClipAndNormTransform,
+    ComputeROITransform,
     ToDeviceTransform,
     NoduleInstanceSegTransform,
 )
@@ -56,30 +74,19 @@ from ct_data_management.processing.writers import NPZWriter, NIfTIWriter
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
 
-RAW_BASE  = '/mnt/seagate_exp/radiology/data/raw'
-PROC_BASE = '/mnt/seagate_exp/radiology/data/processed'
 
-# Per-dataset configuration: (DatasetConfig, raw_subdir, processed_subdir)
+# Per-dataset configuration: which DICOM label patterns map to each segmentation type.
+# lung_labels=None means the dataset has no lung segmentation.
 DATASET_CONFIGS = {
     'lidc_idri':       LIDC_IDRI_INFO,
     'nsclc_radiomics': NSCLC_RADIOMICS_INFO,
     'nlst_labeled':    NLST_LABELED_INFO,
 }
 
-# Per-mode configuration: (target_labels, min_num_segments, seg_base)
-# seg_base is used to construct output directory names:
-#   semantic  → {seg_base}_sem_seg_{save_mode}   (e.g. nodule_sem_seg_3d)
-#   instance  → {seg_base}_inst_seg_{save_mode}  (e.g. nodule_inst_seg_3d)
-MODE_CONFIGS = {
-    'nodule': {
-        'lidc_idri':       (['nodule'],           1, 'nodule'),
-        'nsclc_radiomics': (['neoplasm'],         1, 'nodule'),
-        'nlst_labeled':    (['nodule'],           1, 'nodule'),
-    },
-    'roi': {
-        'nsclc_radiomics': (['lung', 'neoplasm'], 2, 'roi'),
-        'nlst_labeled':    (['lung', 'nodule'],   2, 'roi'),
-    },
+DATASET_SEG_CONFIGS = {
+    'lidc_idri':       {'nodule_labels': ['nodule'],   'lung_labels': None},
+    'nsclc_radiomics': {'nodule_labels': ['neoplasm'], 'lung_labels': ['lung']},
+    'nlst_labeled':    {'nodule_labels': ['nodule'],   'lung_labels': ['lung']},
 }
 
 # --- Worker process state (process-local globals) ---
@@ -123,12 +130,35 @@ def _process_series(args):
 
 # --- Pipeline builder ---
 
-def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
-                   seg_base: str, save_modes: list = None, save_formats: list = None,
-                   compress: bool = True, device: str = 'cpu', viewer: bool = False,
-                   label_types: list = None):
-    if save_modes is None:
-        save_modes = ['3d']
+def build_pipeline(save_path: str,
+                   nodule_labels: list,
+                   lung_labels: list,
+                   outputs: list,
+                   nodule_save_modes: list = None,
+                   lung_save_modes: list = None,
+                   roi_save_modes: list = None,
+                   save_formats: list = None,
+                   compress: bool = True,
+                   device: str = 'cpu',
+                   viewer: bool = False,
+                   label_types: list = None,
+                   lung_dilations: int = 0,
+                   roi_crop: bool = False,
+                   roi_padding: int = 1,
+                   anomaly_filter: bool = False,
+                   anomaly_min_size: float = 14.0,
+                   anomaly_max_size: float = 14_137.0,
+                   anomaly_min_hu: float = -800.0,
+                   anomaly_max_hu: float = 700.0,
+                   hu_clip_min: float = -1000.0,
+                   hu_clip_max: float = 400.0):
+
+    if nodule_save_modes is None:
+        nodule_save_modes = ['3d']
+    if lung_save_modes is None:
+        lung_save_modes = ['3d']
+    if roi_save_modes is None:
+        roi_save_modes = ['3d']
     if save_formats is None:
         save_formats = ['numpy']
     if label_types is None:
@@ -141,11 +171,28 @@ def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
 
     parts += [
         IDGenerator(),
-        FilterSegmentsTransform(target_labels=target_labels, min_num_segments=min_num_segments),
+        FilterSegmentsTransform(nodule_labels=nodule_labels, lung_labels=lung_labels),
         OrientTransform(),
         ResampleTransform(),
+    ]
+
+    if lung_dilations > 0:
+        parts.append(LungDilationTransform(n_dilations=lung_dilations))
+
+    if roi_crop:
+        parts.append(ROICropTransform(padding=roi_padding))
+
+    if anomaly_filter:
+        parts.append(NoduleAnomalyFilterTransform(
+            min_voxels=anomaly_min_size,
+            max_voxels=anomaly_max_size,
+            min_hu=anomaly_min_hu,
+            max_hu=anomaly_max_hu,
+        ))
+
+    parts += [
         MergeSegmentsTransform(),
-        ClipAndNormTransform(clip_min=-1000, clip_max=400),
+        HUClipAndNormTransform(clip_min=hu_clip_min, clip_max=hu_clip_max),
     ]
 
     if device != 'cpu':
@@ -155,30 +202,55 @@ def build_pipeline(save_path: str, target_labels: list, min_num_segments: int,
         parts.append(InteractiveViewer())
         return PipelineStack(parts)
 
+    has_nodule   = 'nodule' in outputs
+    has_lung     = 'lung'   in outputs
+    has_roi      = 'roi'    in outputs
     has_semantic = 'semantic' in label_types
     has_instance = 'instance' in label_types
 
-    if has_semantic:
-        for save_mode in save_modes:
-            ct_dir  = os.path.join(save_path, f'ct_{save_mode}')
-            seg_dir = os.path.join(save_path, f'{seg_base}_sem_seg_{save_mode}')
-            for save_format in save_formats:
-                if save_format == 'nifti':
-                    parts.append(NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
-                else:
-                    parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
+    # ct_written tracks which (save_mode, save_format) pairs have already had
+    # their CT directory assigned, so CT is written exactly once per pair.
+    ct_written = set()
 
-    if has_instance:
+    def make_writer(seg_dir, save_mode, save_format, seg_key):
+        pair   = (save_mode, save_format)
+        ct_dir = None if pair in ct_written else os.path.join(save_path, f'ct_{save_mode}')
+        ct_written.add(pair)
+        if save_format == 'nifti':
+            return NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode,
+                               compress=compress, seg_key=seg_key)
+        return NPZWriter(ct_dir, seg_dir, save_mode=save_mode,
+                         compress=compress, seg_key=seg_key)
+
+    # --- Semantic writers (nodule + lung use binary masks before instance transform) ---
+    if has_semantic:
+        if has_nodule:
+            for sm in nodule_save_modes:
+                seg_dir = os.path.join(save_path, f'nodule_sem_seg_{sm}')
+                for sf in save_formats:
+                    parts.append(make_writer(seg_dir, sm, sf, 'nodule_seg'))
+
+        if has_lung:
+            for sm in lung_save_modes:
+                seg_dir = os.path.join(save_path, f'lung_sem_seg_{sm}')
+                for sf in save_formats:
+                    parts.append(make_writer(seg_dir, sm, sf, 'lung_seg'))
+
+    # --- ROI writers (union of lung + nodule; must run before instance transform) ---
+    if has_roi:
+        parts.append(ComputeROITransform())
+        for sm in roi_save_modes:
+            seg_dir = os.path.join(save_path, f'roi_sem_seg_{sm}')
+            for sf in save_formats:
+                parts.append(make_writer(seg_dir, sm, sf, 'roi_seg'))
+
+    # --- Instance writers (nodule_seg is overwritten with instance labels here) ---
+    if has_instance and has_nodule:
         parts.append(NoduleInstanceSegTransform())
-        for save_mode in save_modes:
-            # CT already written by semantic writers; skip it to avoid redundant I/O.
-            ct_dir  = None if has_semantic else os.path.join(save_path, f'ct_{save_mode}')
-            seg_dir = os.path.join(save_path, f'{seg_base}_inst_seg_{save_mode}')
-            for save_format in save_formats:
-                if save_format == 'nifti':
-                    parts.append(NIfTIWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
-                else:
-                    parts.append(NPZWriter(ct_dir, seg_dir, save_mode=save_mode, compress=compress))
+        for sm in nodule_save_modes:
+            seg_dir = os.path.join(save_path, f'nodule_inst_seg_{sm}')
+            for sf in save_formats:
+                parts.append(make_writer(seg_dir, sm, sf, 'nodule_seg'))
 
     return PipelineStack(parts)
 
@@ -195,10 +267,11 @@ class _TqdmLoggingHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-def setup_logging(log_dir: str, dataset: str, mode: str, log_queue=None):
+def setup_logging(log_dir: str, dataset: str, outputs: list, log_queue=None):
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_file = os.path.join(log_dir, f'{dataset}_{mode}_{timestamp}.log')
+    output_tag = '_'.join(outputs)
+    log_file = os.path.join(log_dir, f'{dataset}_{output_tag}_{timestamp}.log')
 
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.DEBUG)
@@ -210,13 +283,12 @@ def setup_logging(log_dir: str, dataset: str, mode: str, log_queue=None):
 
     logger = logging.getLogger('pipeline')
     logger.setLevel(logging.DEBUG)
-    logger.propagate = False  # prevent records reaching the root logger's handlers (e.g. installed by torch/monai)
+    logger.propagate = False
     logger.addHandler(fh)
     logger.addHandler(ch)
     logger.info(f'Logging to {log_file}')
 
     if log_queue is not None:
-        # Workers route records to this queue; listener dispatches them to fh and ch.
         listener = logging.handlers.QueueListener(log_queue, fh, ch, respect_handler_level=True)
         return logger, listener
 
@@ -225,150 +297,252 @@ def setup_logging(log_dir: str, dataset: str, mode: str, log_queue=None):
 
 # --- Helpers ---
 
-def already_processed(save_path: str, seg_base: str, series_id: str,
-                      save_modes: list, save_formats: list, label_types: list,
-                      compress: bool) -> bool:
-    for save_mode in save_modes:
+def already_processed(save_path: str, series_id: str, outputs: list,
+                      nodule_save_modes: list, lung_save_modes: list, roi_save_modes: list,
+                      save_formats: list, label_types: list, compress: bool) -> bool:
+    save_modes_by_output = {'nodule': nodule_save_modes,
+                            'lung':   lung_save_modes,
+                            'roi':    roi_save_modes}
+
+    # Check CT dirs — CT is written once per (save_mode, save_format) pair across all outputs.
+    ct_pairs_needed = {(sm, sf)
+                       for output in outputs
+                       for sm in save_modes_by_output[output]
+                       for sf in save_formats}
+    for save_mode, save_format in ct_pairs_needed:
+        ext  = '.nii.gz' if (save_format == 'nifti' and compress) else \
+               '.nii'    if  save_format == 'nifti'               else '.npz'
+        stem = series_id if save_mode == '3d' else f'{series_id}_0000'
         ct_dir = os.path.join(save_path, f'ct_{save_mode}')
-        for save_format in save_formats:
-            ext = '.nii.gz' if (save_format == 'nifti' and compress) else \
-                  '.nii'    if  save_format == 'nifti'               else '.npz'
-            stem = series_id if save_mode == '3d' else f'{series_id}_0000'
-            # CT is shared across label types; check it once per (save_mode, save_format).
-            if not os.path.exists(os.path.join(ct_dir, stem + ext)):
-                return False
-            # Seg is label-type-specific.
-            for label_type in label_types:
-                suffix  = 'sem' if label_type == 'semantic' else 'inst'
-                seg_dir = os.path.join(save_path, f'{seg_base}_{suffix}_seg_{save_mode}')
-                if not os.path.exists(os.path.join(seg_dir, stem + ext)):
-                    return False
+        if not os.path.exists(os.path.join(ct_dir, stem + ext)):
+            return False
+
+    # Check per-output segmentation dirs using each output's own save modes.
+    for output in outputs:
+        for save_mode in save_modes_by_output[output]:
+            for save_format in save_formats:
+                ext  = '.nii.gz' if (save_format == 'nifti' and compress) else \
+                       '.nii'    if  save_format == 'nifti'               else '.npz'
+                stem = series_id if save_mode == '3d' else f'{series_id}_0000'
+
+                if output == 'nodule':
+                    if 'semantic' in label_types:
+                        seg_dir = os.path.join(save_path, f'nodule_sem_seg_{save_mode}')
+                        if not os.path.exists(os.path.join(seg_dir, stem + ext)):
+                            return False
+                    if 'instance' in label_types:
+                        seg_dir = os.path.join(save_path, f'nodule_inst_seg_{save_mode}')
+                        if not os.path.exists(os.path.join(seg_dir, stem + ext)):
+                            return False
+                elif output == 'lung':
+                    seg_dir = os.path.join(save_path, f'lung_sem_seg_{save_mode}')
+                    if not os.path.exists(os.path.join(seg_dir, stem + ext)):
+                        return False
+                elif output == 'roi':
+                    seg_dir = os.path.join(save_path, f'roi_sem_seg_{save_mode}')
+                    if not os.path.exists(os.path.join(seg_dir, stem + ext)):
+                        return False
     return True
 
 
-# --- Entry point ---
+# --- Config ---
 
-def main():
-    parser = argparse.ArgumentParser(description='CT nodule dataset processing pipeline.')
-    parser.add_argument('--dataset',     required=True, choices=list(DATASET_CONFIGS),
-                        help='Dataset to process.')
-    parser.add_argument('--mode',        required=True, choices=['nodule', 'roi'],
-                        help='Processing mode.')
-    parser.add_argument('--sync',          action='store_true',
-                        help='Download / update raw data before processing.')
-    parser.add_argument('--download-only', action='store_true', dest='download_only',
-                        help='Download / update raw data and exit without processing. Implies --sync.')
-    parser.add_argument('--reprocess',   action='store_true',
-                        help='Re-process series that already have output files.')
-    parser.add_argument('--save-mode',   default='3d', dest='save_mode',
-                        help='Comma-separated save modes: 3d, 2d, or 3d,2d. Default: 3d.')
-    parser.add_argument('--save-format', default='numpy', dest='save_format',
-                        help='Comma-separated save formats: numpy, nifti, or numpy,nifti. Default: numpy.')
-    parser.add_argument('--no-compress', action='store_false', dest='compress',
-                        help='Save uncompressed files (faster writes, larger files). '
-                             'Produces .npz for numpy format and .nii for nifti format.')
-    parser.add_argument('--workers',     type=int, default=None,
-                        help='Number of worker processes. Default: number of available GPUs (or 1 if none).')
-    parser.add_argument('--cpu',         action='store_true',
-                        help='Force CPU-only execution regardless of GPU availability. Implies --workers 1.')
-    parser.add_argument('--view',        action='store_true',
-                        help='Open interactive viewer instead of saving NPZ files. Implies --cpu.')
-    parser.add_argument('--label-type',  default='semantic', dest='label_type',
-                        help='Comma-separated label types: semantic, instance, or semantic,instance. '
-                             'Default: semantic. instance is only valid with --mode nodule.')
-    args = parser.parse_args()
+DEFAULTS = {
+    # Paths
+    'raw_data_path':       '../data/raw',
+    'processed_data_path': '../data/processed',
+    'save_path':           None,        # overrides processed_data_path/<dataset> when set
+    # Output
+    'output':              'nodule',    # comma-separated or list: nodule, lung, roi
+    'save_format':         'numpy',     # comma-separated or list: numpy, nifti
+    'compress':            True,
+    'label_type':          'semantic',  # comma-separated or list: semantic, instance
+    'save_mode':           '3d',        # global fallback; comma-separated or list: 3d, 2d
+    'nodule_save_mode':    None,        # overrides save_mode for nodule output
+    'lung_save_mode':      None,        # overrides save_mode for lung output
+    'roi_save_mode':       None,        # overrides save_mode for roi output
+    # Execution
+    'sync':                False,
+    'download_only':       False,
+    'reprocess':           False,
+    'cpu':                 False,
+    'workers':             None,        # defaults to number of available GPUs (min 1)
+    'viewer':              False,
+    # Hyperparameters
+    'lung_dilations':      0,           # dilation iterations on lung mask (0 = disabled)
+    'roi_crop':            False,
+    'roi_padding':         1,           # voxels of padding around ROI crop bounding box
+    'anomaly_filter':      False,
+    'anomaly_min_size':    14.0,        # mm³ — ≈ 3 mm diameter sphere
+    'anomaly_max_size':    14_137.0,    # mm³ — ≈ 30 mm diameter sphere
+    'anomaly_min_hu':      -800.0,
+    'anomaly_max_hu':      700.0,
+    # HU windowing applied before normalisation
+    'hu_clip_min':         -1000.0,
+    'hu_clip_max':         400.0,
+}
 
+
+def load_config(path: str) -> dict:
+    """Load a YAML or TOML config file and return the raw dict."""
+    if path.endswith(('.yaml', '.yml')):
+        import yaml
+        with open(path) as f:
+            return yaml.safe_load(f)
+    if path.endswith('.toml'):
+        try:
+            import tomllib
+        except ImportError:
+            import tomli as tomllib     # pip install tomli on Python < 3.11
+        with open(path, 'rb') as f:
+            return tomllib.load(f)
+    raise SystemExit(f"Unsupported config format '{path}'. Use .yaml, .yml, or .toml.")
+
+
+def _to_list(val) -> list:
+    """Normalise a string or list config value to a deduplicated list."""
+    if isinstance(val, list):
+        return list(dict.fromkeys(str(v).strip() for v in val))
+    return list(dict.fromkeys(v.strip() for v in str(val).split(',')))
+
+
+# --- Run ---
+
+def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
+    VALID_OUTPUTS      = {'nodule', 'lung', 'roi'}
     VALID_SAVE_MODES   = {'3d', '2d'}
     VALID_SAVE_FORMATS = {'numpy', 'nifti'}
     VALID_LABEL_TYPES  = {'semantic', 'instance'}
-    save_modes   = [v.strip() for v in args.save_mode.split(',')]
-    save_formats = [v.strip() for v in args.save_format.split(',')]
-    label_types  = [v.strip() for v in args.label_type.split(',')]
-    invalid_modes        = [m for m in save_modes   if m not in VALID_SAVE_MODES]
-    invalid_formats      = [f for f in save_formats if f not in VALID_SAVE_FORMATS]
-    invalid_label_types  = [t for t in label_types  if t not in VALID_LABEL_TYPES]
-    if invalid_modes:
-        parser.error(f'Invalid --save-mode value(s): {invalid_modes}. Choose from {sorted(VALID_SAVE_MODES)}.')
-    if invalid_formats:
-        parser.error(f'Invalid --save-format value(s): {invalid_formats}. Choose from {sorted(VALID_SAVE_FORMATS)}.')
-    if invalid_label_types:
-        parser.error(f'Invalid --label-type value(s): {invalid_label_types}. Choose from {sorted(VALID_LABEL_TYPES)}.')
-    # Canonical order: semantic writers run before NoduleInstanceSegTransform.
+
+    dataset = cfg.get('dataset')
+    if not dataset:
+        raise SystemExit(f'Run {run_index + 1}: "dataset" is required.')
+    if dataset not in DATASET_CONFIGS:
+        raise SystemExit(f'Run {run_index + 1}: unknown dataset "{dataset}". '
+                         f'Choose from {sorted(DATASET_CONFIGS)}.')
+
+    outputs      = _to_list(cfg['output'])
+    save_formats = _to_list(cfg['save_format'])
+    label_types  = _to_list(cfg['label_type'])
+    save_modes   = _to_list(cfg['save_mode'])
+
+    def check(vals, valid, field):
+        bad = [v for v in vals if v not in valid]
+        if bad:
+            raise SystemExit(f'Run {run_index + 1} ({dataset}): '
+                             f'invalid {field!r} value(s) {bad}. '
+                             f'Choose from {sorted(valid)}.')
+
+    check(outputs,      VALID_OUTPUTS,       'output')
+    check(save_formats, VALID_SAVE_FORMATS,  'save_format')
+    check(label_types,  VALID_LABEL_TYPES,   'label_type')
+    check(save_modes,   VALID_SAVE_MODES,    'save_mode')
+
+    def resolve_mode(val):
+        if val is None:
+            return list(dict.fromkeys(save_modes))
+        modes = _to_list(val)
+        check(modes, VALID_SAVE_MODES, 'save_mode override')
+        return modes
+
+    nodule_save_modes = resolve_mode(cfg.get('nodule_save_mode'))
+    lung_save_modes   = resolve_mode(cfg.get('lung_save_mode'))
+    roi_save_modes    = resolve_mode(cfg.get('roi_save_mode'))
+
+    outputs     = sorted(set(outputs),     key=lambda o: {'nodule': 0, 'lung': 1, 'roi': 2}[o])
     label_types = sorted(set(label_types), key=lambda t: 0 if t == 'semantic' else 1)
 
-    dataset = args.dataset
-    mode    = args.mode
+    seg_config    = DATASET_SEG_CONFIGS[dataset]
+    nodule_labels = seg_config['nodule_labels']
+    lung_labels   = seg_config['lung_labels']
 
-    if 'instance' in label_types and mode != 'nodule':
-        parser.error('--label-type instance is only valid with --mode nodule.')
+    def err(msg):
+        raise SystemExit(f'Run {run_index + 1} ({dataset}): {msg}')
 
-    if dataset not in MODE_CONFIGS.get(mode, {}):
-        parser.error(f'Mode "{mode}" is not defined for dataset "{dataset}".')
+    if 'lung' in outputs and lung_labels is None:
+        err(f'output "lung" requires lung annotations, which "{dataset}" does not have.')
+    if 'roi' in outputs and lung_labels is None:
+        err(f'output "roi" (lung ∪ nodule) requires lung annotations, which "{dataset}" does not have.')
+    if 'instance' in label_types and 'nodule' not in outputs:
+        err('"instance" label_type requires output to include "nodule".')
+    if (cfg['roi_crop'] or cfg['lung_dilations'] > 0) and lung_labels is None:
+        err('"roi_crop" and "lung_dilations" require lung annotations.')
+    if cfg['anomaly_filter'] and 'nodule' not in outputs:
+        err('"anomaly_filter" requires output to include "nodule".')
 
-    target_labels, min_num_segments, seg_base = MODE_CONFIGS[mode][dataset]
-
-    raw_path  = os.path.join(RAW_BASE,  dataset)
-    save_path = os.path.join(PROC_BASE, dataset)
+    raw_path  = os.path.join(cfg['raw_data_path'], dataset)
+    save_path = cfg['save_path'] or os.path.join(cfg['processed_data_path'], dataset)
     log_dir   = os.path.join(save_path, 'logs')
 
-    # Determine GPU count and effective worker count.
-    if args.cpu or args.view:
-        n_gpus    = 0
-        n_workers = 1
-    else:
-        n_gpus    = torch.cuda.device_count()
-        n_workers = args.workers if args.workers is not None else max(n_gpus, 1)
-
-    # spawn must be set before any multiprocessing objects are created.
-    if n_workers > 1:
-        mp.set_start_method('spawn', force=True)
-
-    torch.set_grad_enabled(False)
+    cpu       = cfg['cpu'] or cfg['viewer']
+    n_gpus    = 0 if cpu else torch.cuda.device_count()
+    n_workers = 1 if cpu else (cfg['workers'] if cfg['workers'] is not None else max(n_gpus, 1))
 
     data_manager = IDCFileSystemDataManager(raw_path, DATASET_CONFIGS[dataset])
 
     pipeline_kwargs = dict(
         save_path=save_path,
-        target_labels=target_labels,
-        min_num_segments=min_num_segments,
-        seg_base=seg_base,
-        save_modes=save_modes,
+        nodule_labels=nodule_labels,
+        lung_labels=lung_labels,
+        outputs=outputs,
+        nodule_save_modes=nodule_save_modes,
+        lung_save_modes=lung_save_modes,
+        roi_save_modes=roi_save_modes,
         save_formats=save_formats,
-        compress=args.compress,
-        viewer=args.view,
+        compress=cfg['compress'],
+        viewer=cfg['viewer'],
         label_types=label_types,
+        lung_dilations=cfg['lung_dilations'],
+        roi_crop=cfg['roi_crop'],
+        roi_padding=cfg['roi_padding'],
+        anomaly_filter=cfg['anomaly_filter'],
+        anomaly_min_size=cfg['anomaly_min_size'],
+        anomaly_max_size=cfg['anomaly_max_size'],
+        anomaly_min_hu=cfg['anomaly_min_hu'],
+        anomaly_max_hu=cfg['anomaly_max_hu'],
+        hu_clip_min=cfg['hu_clip_min'],
+        hu_clip_max=cfg['hu_clip_max'],
     )
 
     if n_workers > 1:
         log_queue = mp.Manager().Queue()
-        logger, listener = setup_logging(log_dir, dataset, mode, log_queue=log_queue)
+        logger, listener = setup_logging(log_dir, dataset, outputs, log_queue=log_queue)
         listener.start()
     else:
-        logger, _ = setup_logging(log_dir, dataset, mode)
+        logger, _ = setup_logging(log_dir, dataset, outputs)
 
-    logger.info(f'Dataset:   {dataset}  Mode: {mode}  Save modes: {save_modes}  Save formats: {save_formats}  Label types: {label_types}')
+    prefix = f'[{run_index + 1}/{total_runs}] ' if total_runs > 1 else ''
+    logger.info(f'{prefix}Dataset: {dataset}  Output: {outputs}  '
+                f'Save formats: {save_formats}  Label types: {label_types}')
+    logger.info(f'Save modes — nodule: {nodule_save_modes}  '
+                f'lung: {lung_save_modes}  roi: {roi_save_modes}')
     logger.info(f'Raw path:  {raw_path}')
     logger.info(f'Save path: {save_path}')
     logger.info(f'Workers:   {n_workers}  GPUs: {n_gpus}')
 
-    if args.sync or args.download_only:
+    if cfg['sync'] or cfg['download_only']:
         logger.info('Syncing raw data...')
         data_manager.sync_data()
 
-    if args.download_only:
-        logger.info('Download complete. Exiting (--download-only).')
+    if cfg['download_only']:
+        logger.info('Download complete. Skipping processing (download_only: true).')
+        if n_workers > 1:
+            listener.stop()
         return
 
-    # Build task list in main process (D7: already_processed check before workers start).
     all_paths = list(data_manager.get_paths())
-    n_total = len(all_paths)
+    n_total   = len(all_paths)
 
-    if not args.reprocess:
+    if not cfg['reprocess']:
         tasks = [
             (ct_path, seg_path_list)
             for ct_path, seg_path_list in all_paths
-            if not already_processed(save_path, seg_base, os.path.basename(ct_path),
-                                     save_modes, save_formats, label_types, args.compress)
+            if not already_processed(
+                save_path, os.path.basename(ct_path),
+                outputs,
+                nodule_save_modes, lung_save_modes, roi_save_modes,
+                save_formats, label_types, cfg['compress'],
+            )
         ]
         n_skipped = n_total - len(tasks)
     else:
@@ -394,7 +568,7 @@ def main():
         finally:
             listener.stop()
     else:
-        device   = f'cuda:0' if n_gpus > 0 else 'cpu'
+        device   = 'cuda:0' if n_gpus > 0 else 'cpu'
         pipeline = build_pipeline(device=device, **pipeline_kwargs)
         for ct_path, seg_path_list in tqdm(tasks, total=n_tasks):
             series_id = os.path.basename(ct_path)
@@ -414,6 +588,31 @@ def main():
         f'Done. Total: {n_total}  Processed: {n_processed}  '
         f'Skipped: {n_skipped}  Failed: {n_failed}'
     )
+
+
+# --- Entry point ---
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='CT nodule dataset processing pipeline.',
+        epilog='See configs/ for example YAML and TOML configuration files.',
+    )
+    parser.add_argument('config', help='Path to a YAML (.yaml/.yml) or TOML (.toml) config file.')
+    args = parser.parse_args()
+
+    raw            = load_config(args.config)
+    global_defaults = raw.get('defaults', {})
+    runs           = raw.get('runs', [])
+
+    if not runs:
+        raise SystemExit('Config file must define at least one entry under "runs".')
+
+    mp.set_start_method('spawn', force=True)
+    torch.set_grad_enabled(False)
+
+    for i, run_override in enumerate(runs):
+        cfg = {**DEFAULTS, **global_defaults, **run_override}
+        run_one(cfg, run_index=i, total_runs=len(runs))
 
 
 if __name__ == '__main__':

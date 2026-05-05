@@ -84,7 +84,7 @@ def main():
 
     if args.seg:
         seg_tensors = [instances_to_channels(load(p)) for p in args.seg]
-        data['seg'] = torch.cat(seg_tensors, dim=0)
+        data['nodule_seg'] = torch.cat(seg_tensors, dim=0)
 
     InteractiveViewer()(data, {})
 

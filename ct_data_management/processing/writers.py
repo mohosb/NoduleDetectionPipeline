@@ -35,8 +35,10 @@ class NPZWriter(PipelinePart):
         direction: 3×3 direction cosine matrix.
 
     Args:
-        ct_save_path:  Directory to write CT files into.
-        seg_save_path: Directory to write segmentation files into.
+        ct_save_path:  Directory to write CT files into.  ``None`` skips CT writing
+                       (used when CT has already been written by an earlier writer).
+        seg_save_path: Directory to write segmentation files into.  ``None`` skips
+                       segmentation writing.
         save_mode:     '3d' — one NPZ per volume (default):
                               <save_path>/<series_id>.npz
                        '2d' — one NPZ per axial slice (last axis, D in C×H×W×D):
@@ -45,19 +47,23 @@ class NPZWriter(PipelinePart):
                        as a spatial reference.
         compress:      If True (default), use np.savez_compressed.
                        If False, use np.savez (faster writes, larger files).
+        seg_key:       Key in ``data`` dict to read the segmentation tensor from.
+                       Default: ``'nodule_seg'``.
     """
 
-    def __init__(self, ct_save_path, seg_save_path, save_mode='3d', compress=True):
+    def __init__(self, ct_save_path, seg_save_path, save_mode='3d',
+                 compress=True, seg_key='nodule_seg'):
         if save_mode not in ('3d', '2d'):
             raise ValueError(f"save_mode must be '3d' or '2d', got '{save_mode}'")
         self._ct_save_path  = ct_save_path
         self._seg_save_path = seg_save_path
         self._save_mode     = save_mode
         self._savez         = np.savez_compressed if compress else np.savez
+        self._seg_key       = seg_key
 
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
         ct_data  = data.get('ct')
-        seg_data = data.get('seg')
+        seg_data = data.get(self._seg_key)
 
         save_id = params.get('id', None)
         if save_id is None:
@@ -121,27 +127,31 @@ class NIfTIWriter(PipelinePart):
         (H, W, D, C) as a 4-D NIfTI.
 
     Args:
-        ct_save_path:  Directory to write CT files into.
-        seg_save_path: Directory to write segmentation files into.
+        ct_save_path:  Directory to write CT files into.  ``None`` skips CT writing.
+        seg_save_path: Directory to write segmentation files into.  ``None`` skips
+                       segmentation writing.
         save_mode:     '3d' — one NIfTI per volume (default).
                        '2d' — one NIfTI per axial slice; the affine origin is
-                              shifted per-slice so each file is spatially
-                              accurate.
+                              shifted per-slice so each file is spatially accurate.
         compress:      If True (default), write .nii.gz.
                        If False, write .nii (faster writes, larger files).
+        seg_key:       Key in ``data`` dict to read the segmentation tensor from.
+                       Default: ``'nodule_seg'``.
     """
 
-    def __init__(self, ct_save_path, seg_save_path, save_mode='3d', compress=True):
+    def __init__(self, ct_save_path, seg_save_path, save_mode='3d',
+                 compress=True, seg_key='nodule_seg'):
         if save_mode not in ('3d', '2d'):
             raise ValueError(f"save_mode must be '3d' or '2d', got '{save_mode}'")
         self._ct_save_path  = ct_save_path
         self._seg_save_path = seg_save_path
         self._save_mode     = save_mode
         self._ext           = '.nii.gz' if compress else '.nii'
+        self._seg_key       = seg_key
 
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
         ct_data  = data.get('ct')
-        seg_data = data.get('seg')
+        seg_data = data.get(self._seg_key)
 
         save_id = params.get('id', None)
         if save_id is None:

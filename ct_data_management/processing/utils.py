@@ -21,19 +21,24 @@ class TimePipelinePart(PipelinePart):
 
 class InteractiveViewer(PipelinePart):
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
-        ct_data  = data.get('ct')
-        seg_data = data.get('seg')
+        ct_data = data.get('ct')
+
+        # Collect all available segmentation types in display order.
+        seg_tensors = [data[k] for k in ('nodule_seg', 'lung_seg', 'roi_seg')
+                       if data.get(k) is not None]
 
         blended = ct_data
-        if seg_data is not None:
+        if seg_tensors:
             colors = plt.get_cmap('tab10').colors
-            for i, color in zip(range(seg_data.size(0)), itertools.cycle(colors)):
-                blended = blend_images(
-                    image=blended,
-                    label=seg_data[i, ...][None, ...],
-                    alpha=0.5,
-                    cmap=ListedColormap(['none', color])
-                )
+            color_cycle = itertools.cycle(colors)
+            for seg_data in seg_tensors:
+                for i in range(seg_data.size(0)):
+                    blended = blend_images(
+                        image=blended,
+                        label=seg_data[i, ...][None, ...],
+                        alpha=0.5,
+                        cmap=ListedColormap(['none', next(color_cycle)])
+                    )
 
         blended = blended.numpy().transpose(3, 2, 1, 0)[:, ::-1]
         z_max = blended.shape[0] - 1

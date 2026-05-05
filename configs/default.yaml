@@ -1,0 +1,54 @@
+# Unified dataset run — LIDC-IDRI + NSCLC-Radiomics + NLST-Labeled
+#
+# All three datasets share a single output directory so that ct_3d/,
+# nodule_inst_seg_3d/, roi_sem_seg_2d/, etc. contain samples from every
+# dataset side by side, ready for a unified train/val/test split.
+#
+# LIDC-IDRI has no lung annotations so it only contributes to the nodule
+# and CT 3-D outputs; the other two datasets also produce 2-D ROI slices.
+
+defaults:
+  raw_data_path:       ../data/raw
+  processed_data_path: ../data/processed
+  save_path:           ../data/processed/unified
+
+  # Format
+  save_format: numpy
+  compress:    false
+
+  # Execution
+  cpu: true
+
+  # Labels
+  label_type:        semantic
+  nodule_save_mode:  3d
+
+  # HU windowing applied before normalisation
+  hu_clip_min: -1000.0
+  hu_clip_max:  400.0
+
+  # Anomaly filtering (thresholds in mm³ and HU)
+  anomaly_filter:   true
+  anomaly_min_size: 14.0      # ≈ 3 mm diameter sphere
+  anomaly_max_size: 14137.0   # ≈ 30 mm diameter sphere
+  anomaly_min_hu:   -800.0
+  anomaly_max_hu:   700.0
+
+  # Morphological / crop hyperparameters
+  lung_dilations: 0
+  roi_padding:    1
+
+runs:
+  # LIDC-IDRI: nodule annotations only (no lung segmentation available)
+  - dataset: lidc_idri
+    output:  nodule
+
+  # NSCLC-Radiomics: full pipeline — nodule (3-D) + ROI (2-D slices)
+  - dataset:       nsclc_radiomics
+    output:        nodule,roi
+    roi_save_mode: 2d
+
+  # NLST-Labeled: same as NSCLC-Radiomics
+  - dataset:       nlst_labeled
+    output:        nodule,roi
+    roi_save_mode: 2d
