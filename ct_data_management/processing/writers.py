@@ -1,7 +1,10 @@
 from pathlib import Path
+import csv
+import fcntl
 import os
 import numpy as np
 import nibabel as nib
+import scipy.ndimage as ndi
 from .pipeline import PipelinePart
 
 
@@ -219,3 +222,113 @@ class NIfTIWriter(PipelinePart):
         path = os.path.join(save_dir, file_id + self._ext)
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         nib.save(img, path)
+
+
+_CATALOG_COLUMNS = ['patient_id', 'series_uid', 'dataset', 'nodule_id', 'volume_mm3', 'entropy']
+
+
+def _nodule_entropy(
+    ct_voxels: np.ndarray,
+    hu_clip_min: float,
+    hu_clip_max: float,
+    bin_width_hu: float = 25.0,
+) -> float:
+    n_bins = round((hu_clip_max - hu_clip_min) / bin_width_hu)
+    counts, _ = np.histogram(ct_voxels, bins=n_bins, range=(0.0, 1.0))
+    p = counts / counts.sum()
+    p = p[p > 0]
+    return float(-np.sum(p * np.log2(p)))
+
+
+class NoduleCatalogWriter(PipelinePart):
+    """Appends per-nodule statistics to a shared CSV catalog after each processed scan.
+
+    Reads the normalized CT (data['ct']) and the nodule segmentation mask
+    (data['nodule_seg']) that is present at the end of the pipeline.  If the
+    mask contains instance labels (max > 1) they are used directly; otherwise
+    connected-component analysis separates the binary mask into individual
+    nodules.
+
+    The CSV is written with an exclusive POSIX file lock so concurrent worker
+    processes can safely append to the same file.
+
+    Args:
+        catalog_path: Path to the output CSV file.
+        dataset:      Dataset label written into every row ('lidc_idri',
+                      'nsclc_radiomics', 'nlst_radiologist', or 'nlst_ai').
+        hu_clip_min:  Lower HU bound used during normalization (default -1000).
+        hu_clip_max:  Upper HU bound used during normalization (default  400).
+    """
+
+    def __init__(
+        self,
+        catalog_path: str,
+        dataset: str,
+        hu_clip_min: float = -1000.0,
+        hu_clip_max: float = 400.0,
+    ):
+        self._catalog_path = catalog_path
+        self._dataset      = dataset
+        self._hu_clip_min  = hu_clip_min
+        self._hu_clip_max  = hu_clip_max
+
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        seg_data = data.get('nodule_seg')
+        ct_data  = data.get('ct')
+        if seg_data is None or ct_data is None:
+            return data, params
+
+        series_uid = params.get('id', '')
+        patient_id = ''
+        ct_header  = params.get('ct_header')
+        if ct_header is not None:
+            patient_id = str(getattr(ct_header, 'PatientID', ''))
+
+        seg_arr = seg_data.cpu().numpy()          # (1, H, W, D)
+        ct_arr  = ct_data.cpu().numpy()           # (1, H, W, D)
+        spacing = np.array(seg_data.meta.get('pixdim', [1, 1, 1, 1])[1:4], dtype=float)
+        voxel_volume = float(np.prod(spacing))
+
+        mask_3d = seg_arr[0]                      # (H, W, D)
+        ct_3d   = ct_arr[0]
+
+        if mask_3d.max() > 1:
+            # Instance labels already assigned by NoduleInstanceSegTransform
+            nodule_ids = np.unique(mask_3d[mask_3d > 0]).astype(int)
+            nodule_masks = [(nid, mask_3d == nid) for nid in nodule_ids]
+        else:
+            labeled, n = ndi.label(mask_3d > 0)
+            nodule_masks = [(nid, labeled == nid) for nid in range(1, n + 1)]
+
+        rows = []
+        for nodule_id, mask in nodule_masks:
+            voxel_count = int(mask.sum())
+            if voxel_count == 0:
+                continue
+            volume  = voxel_count * voxel_volume
+            entropy = _nodule_entropy(ct_3d[mask], self._hu_clip_min, self._hu_clip_max)
+            rows.append({
+                'patient_id': patient_id,
+                'series_uid': series_uid,
+                'dataset':    self._dataset,
+                'nodule_id':  int(nodule_id),
+                'volume_mm3': round(volume, 4),
+                'entropy':    round(entropy, 6),
+            })
+
+        if not rows:
+            return data, params
+
+        Path(self._catalog_path).parent.mkdir(parents=True, exist_ok=True)
+
+        with open(self._catalog_path, 'a', newline='') as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            try:
+                writer = csv.DictWriter(f, fieldnames=_CATALOG_COLUMNS)
+                if f.tell() == 0:
+                    writer.writeheader()
+                writer.writerows(rows)
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+
+        return data, params

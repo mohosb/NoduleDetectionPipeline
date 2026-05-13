@@ -52,7 +52,8 @@ from ct_data_management.acquisition import (
     IDCFileSystemDataManager,
     LIDC_IDRI_INFO,
     NSCLC_RADIOMICS_INFO,
-    NLST_LABELED_INFO,
+    NLST_RADIOLOGIST_INFO,
+    NLST_AI_INFO,
 )
 from ct_data_management.processing.pipeline import PipelineStack
 from ct_data_management.processing.readers import DICOMFileSystemReader
@@ -70,7 +71,7 @@ from ct_data_management.processing.transforms import (
     ToDeviceTransform,
     NoduleInstanceSegTransform,
 )
-from ct_data_management.processing.writers import NPZWriter, NIfTIWriter
+from ct_data_management.processing.writers import NPZWriter, NIfTIWriter, NoduleCatalogWriter
 from ct_data_management.processing.utils import InteractiveViewer, TimePipelinePart
 
 
@@ -78,15 +79,17 @@ from ct_data_management.processing.utils import InteractiveViewer, TimePipelineP
 # Per-dataset configuration: which DICOM label patterns map to each segmentation type.
 # lung_labels=None means the dataset has no lung segmentation.
 DATASET_CONFIGS = {
-    'lidc_idri':       LIDC_IDRI_INFO,
-    'nsclc_radiomics': NSCLC_RADIOMICS_INFO,
-    'nlst_labeled':    NLST_LABELED_INFO,
+    'lidc_idri':        LIDC_IDRI_INFO,
+    'nsclc_radiomics':  NSCLC_RADIOMICS_INFO,
+    'nlst_radiologist': NLST_RADIOLOGIST_INFO,
+    'nlst_ai':          NLST_AI_INFO,
 }
 
 DATASET_SEG_CONFIGS = {
-    'lidc_idri':       {'nodule_labels': ['nodule'],   'lung_labels': None},
-    'nsclc_radiomics': {'nodule_labels': ['neoplasm'], 'lung_labels': ['lung']},
-    'nlst_labeled':    {'nodule_labels': ['nodule'],   'lung_labels': ['lung']},
+    'lidc_idri':        {'nodule_labels': ['nodule'],   'lung_labels': None},
+    'nsclc_radiomics':  {'nodule_labels': ['neoplasm'], 'lung_labels': ['lung']},
+    'nlst_radiologist': {'nodule_labels': ['nodule'],   'lung_labels': ['lung']},
+    'nlst_ai':          {'nodule_labels': ['nodule'],   'lung_labels': ['lung']},
 }
 
 # --- Worker process state (process-local globals) ---
@@ -134,6 +137,7 @@ def build_pipeline(save_path: str,
                    nodule_labels: list,
                    lung_labels: list,
                    outputs: list,
+                   dataset: str = '',
                    nodule_save_modes: list = None,
                    lung_save_modes: list = None,
                    roi_save_modes: list = None,
@@ -146,12 +150,13 @@ def build_pipeline(save_path: str,
                    roi_crop: bool = False,
                    roi_padding: int = 1,
                    anomaly_filter: bool = False,
-                   anomaly_min_size: float = 14.0,
-                   anomaly_max_size: float = 14_137.0,
-                   anomaly_min_hu: float = -800.0,
-                   anomaly_max_hu: float = 700.0,
+                   anomaly_min_size: float = float('-inf'),
+                   anomaly_max_size: float = float('inf'),
+                   anomaly_min_hu: float = float('-inf'),
+                   anomaly_max_hu: float = float('inf'),
                    hu_clip_min: float = -1000.0,
-                   hu_clip_max: float = 400.0):
+                   hu_clip_max: float = 400.0,
+                   catalog_path: str = None):
 
     if nodule_save_modes is None:
         nodule_save_modes = ['3d']
@@ -251,6 +256,15 @@ def build_pipeline(save_path: str,
             seg_dir = os.path.join(save_path, f'nodule_inst_seg_{sm}')
             for sf in save_formats:
                 parts.append(make_writer(seg_dir, sm, sf, 'nodule_seg'))
+
+    # --- Nodule catalog (runs last so it sees instance labels if available) ---
+    if catalog_path is not None and has_nodule:
+        parts.append(NoduleCatalogWriter(
+            catalog_path=catalog_path,
+            dataset=dataset,
+            hu_clip_min=hu_clip_min,
+            hu_clip_max=hu_clip_max,
+        ))
 
     return PipelineStack(parts)
 
@@ -373,13 +387,15 @@ DEFAULTS = {
     'roi_crop':            False,
     'roi_padding':         1,           # voxels of padding around ROI crop bounding box
     'anomaly_filter':      False,
-    'anomaly_min_size':    14.0,        # mm³ — ≈ 3 mm diameter sphere
-    'anomaly_max_size':    14_137.0,    # mm³ — ≈ 30 mm diameter sphere
-    'anomaly_min_hu':      -800.0,
-    'anomaly_max_hu':      700.0,
+    'anomaly_min_size':    float('-inf'),
+    'anomaly_max_size':    float('inf'),
+    'anomaly_min_hu':      float('-inf'),
+    'anomaly_max_hu':      float('inf'),
     # HU windowing applied before normalisation
     'hu_clip_min':         -1000.0,
     'hu_clip_max':         400.0,
+    # Nodule catalog — None disables catalog writing
+    'catalog_path':        None,     # defaults to <save_path>/nodule_catalog.csv when omitted
 }
 
 
@@ -480,8 +496,11 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
 
     data_manager = IDCFileSystemDataManager(raw_path, DATASET_CONFIGS[dataset])
 
+    catalog_path = cfg['catalog_path'] or os.path.join(save_path, 'nodule_catalog.csv')
+
     pipeline_kwargs = dict(
         save_path=save_path,
+        dataset=dataset,
         nodule_labels=nodule_labels,
         lung_labels=lung_labels,
         outputs=outputs,
@@ -502,6 +521,7 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
         anomaly_max_hu=cfg['anomaly_max_hu'],
         hu_clip_min=cfg['hu_clip_min'],
         hu_clip_max=cfg['hu_clip_max'],
+        catalog_path=catalog_path,
     )
 
     if n_workers > 1:

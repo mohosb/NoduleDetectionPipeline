@@ -99,16 +99,7 @@ class HUClipAndNormTransform(PipelinePart):
 
         if ct_data is not None:
             ct_data.clip_(self.clip_min, self.clip_max)
-
-            ct_data_min = ct_data.min()
-            ct_data_max = ct_data.max()
-            denom = ct_data_max - ct_data_min
-            if denom == 0:
-                ct_data = torch.zeros_like(ct_data)
-            else:
-                ct_data = (ct_data - ct_data_min) / denom
-
-            data['ct'] = ct_data
+            data['ct'] = (ct_data - self.clip_min) / (self.clip_max - self.clip_min)
 
         return data, params
 
@@ -257,8 +248,8 @@ class NoduleAnomalyFilterTransform(PipelinePart):
 
     _STRUCTURE = ndi.generate_binary_structure(3, 3)   # 26-connectivity
 
-    def __init__(self, min_voxels=14.0, max_voxels=14_137.0,
-                 min_hu=-800.0, max_hu=700.0):
+    def __init__(self, min_voxels=float('-inf'), max_voxels=float('inf'),
+                 min_hu=float('-inf'), max_hu=float('inf')):
         self._min_vol = min_voxels
         self._max_vol = max_voxels
         self._min_hu  = min_hu

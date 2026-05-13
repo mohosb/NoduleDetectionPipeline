@@ -13,29 +13,68 @@ _logger = logging.getLogger('pipeline')
 
 
 @dataclass(frozen=True)
+class SeriesFilter:
+    """
+    Matches a SEG series by SeriesDescription.
+    Append '%' to the pattern to use a SQL LIKE / prefix match.
+    """
+    pattern: str
+
+    def to_sql_condition(self) -> str:
+        if '%' in self.pattern:
+            return f"SeriesDescription LIKE '{self.pattern}'"
+        return f"SeriesDescription = '{self.pattern}'"
+
+    def matches(self, description: str) -> bool:
+        if self.pattern.endswith('%'):
+            return description.startswith(self.pattern[:-1])
+        return description == self.pattern
+
+
+@dataclass(frozen=True)
 class DatasetConfig:
     collection_id: str
-    ct_query_conditions: str
-    seg_query_conditions: str
+    # Ordered highest-priority first. For each study, only the SEGs matched
+    # by the first filter that has at least one hit are downloaded.
+    seg_priority_filters: tuple[SeriesFilter, ...]
 
 
 NSCLC_RADIOMICS_INFO = DatasetConfig(
     collection_id='nsclc_radiomics',
-    ct_query_conditions='TRUE',
-    seg_query_conditions='SeriesDescription = \'Segmentation\'',
+    seg_priority_filters=(SeriesFilter('Segmentation'),),
 )
 
 LIDC_IDRI_INFO = DatasetConfig(
     collection_id='lidc_idri',
-    ct_query_conditions='TRUE',
-    seg_query_conditions='SeriesDescription LIKE \'Segmentation of Nodule %\'',
+    seg_priority_filters=(SeriesFilter('Segmentation of Nodule %'),),
 )
 
-NLST_LABELED_INFO = DatasetConfig(
+NLST_RADIOLOGIST_INFO = DatasetConfig(
     collection_id='nlst',
-    ct_query_conditions='TRUE',
-    seg_query_conditions='SeriesDescription LIKE \'AIMI lung and nodule %\'',
+    seg_priority_filters=(
+        SeriesFilter('AIMI lung and nodule radiologist 8 corrected segmentation'),
+        SeriesFilter('AIMI lung and nodule radiologist 5 corrected segmentation'),
+        SeriesFilter('AIMI lung and nodule radiologist 4 corrected segmentation'),
+    ),
 )
+
+NLST_AI_INFO = DatasetConfig(
+    collection_id='nlst',
+    seg_priority_filters=(
+        SeriesFilter('AIMI lung and nodule AI segmentation'),
+    ),
+)
+
+
+def _select_by_priority(
+    group: pd.DataFrame,
+    filters: tuple[SeriesFilter, ...],
+) -> list[str]:
+    for f in filters:
+        matched = group[group['SeriesDescription'].apply(f.matches)]
+        if not matched.empty:
+            return matched['SeriesInstanceUID'].tolist()
+    return []
 
 
 class DataIntegrityError(Exception):
@@ -94,15 +133,21 @@ class IDCFileSystemDataManager:
 
     def _download_segmentations(self):
         client = self._make_client()
+        filters = self._data_info.seg_priority_filters
+        conditions = ' OR '.join(f.to_sql_condition() for f in filters)
 
         _logger.info('Querying IDC for SEG series...')
-        seg_ids = client.sql_query(f'''
-            SELECT SeriesInstanceUID
+        candidates = client.sql_query(f'''
+            SELECT SeriesInstanceUID, StudyInstanceUID, SeriesDescription
             FROM   index
             WHERE  collection_id = '{self._data_info.collection_id}'
               AND  Modality = 'SEG'
-              AND  {self._data_info.seg_query_conditions}
-        ''')['SeriesInstanceUID'].tolist()
+              AND  ({conditions})
+        ''')
+
+        seg_ids = []
+        for _, study_group in candidates.groupby('StudyInstanceUID'):
+            seg_ids.extend(_select_by_priority(study_group, filters))
 
         _logger.info('Downloading %d SEG series...', len(seg_ids))
         seg_dir = os.path.join(self._data_path, 'seg')

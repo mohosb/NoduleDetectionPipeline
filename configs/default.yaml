@@ -27,12 +27,12 @@ defaults:
   hu_clip_min: -1000.0
   hu_clip_max:  400.0
 
-  # Anomaly filtering (thresholds in mm³ and HU)
+  # Anomaly filtering (thresholds in mm³ and HU; use -.inf / .inf to disable a bound)
   anomaly_filter:   true
-  anomaly_min_size: 14.0      # ≈ 3 mm diameter sphere
-  anomaly_max_size: 14137.0   # ≈ 30 mm diameter sphere
-  anomaly_min_hu:   -800.0
-  anomaly_max_hu:   700.0
+  anomaly_min_size: -.inf
+  anomaly_max_size: .inf
+  anomaly_min_hu:   -.inf
+  anomaly_max_hu:   .inf
 
   # Morphological / crop hyperparameters
   lung_dilations: 0
