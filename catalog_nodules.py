@@ -92,6 +92,15 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
     logger.info('Catalog out: %s', catalog_path)
 
     data_manager = IDCFileSystemDataManager(raw_path, DATASET_CONFIGS[dataset])
+
+    if cfg.get('sync') or cfg.get('download_only'):
+        logger.info('Syncing raw data...')
+        data_manager.sync_data()
+
+    if cfg.get('download_only'):
+        logger.info('Download complete. Skipping processing (download_only: true).')
+        return
+
     all_paths    = list(data_manager.get_paths())
     logger.info('Found %d CT series.', len(all_paths))
 
