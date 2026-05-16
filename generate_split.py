@@ -11,9 +11,23 @@ Test set eligibility:
   - nlst_radiologist all scans (hard cap: 102)
   - nlst_ai          training only
 
-The split is stratified along dataset, median nodule volume, and mean
-nodule entropy (4 quantile bins each).  Sampling is done at the patient
-level so no patient appears in both splits.
+Stratification uses a 4 × 4 × 3 cell grid:
+  axis 0 — median nodule volume quartile (4 bins)
+  axis 1 — mean nodule entropy quartile  (4 bins)
+  axis 2 — dataset                       (3: lidc_idri, nsclc_radiomics,
+                                              nlst_radiologist)
+
+All eligible patients are pooled together and each cell's quota is
+proportional to its share of the full eligible pool.  This balances the
+combined volume/entropy distribution first while keeping each dataset's
+contribution proportional to the data it actually has in each bin.
+
+If the proportional NLST quota exceeds 102, NLST cell quotas are scaled
+down to sum to exactly 102 and the freed slots are redistributed
+proportionally to the non-NLST cells.
+
+Sampling is done at the patient level so no patient appears in both
+splits.
 
 Usage:
     python generate_split.py nodule_catalog.csv
@@ -37,10 +51,11 @@ N_QUANTILE_BINS = 4
 
 
 # ---------------------------------------------------------------------------
-# Core logic
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _aggregate_to_scan(catalog: pd.DataFrame) -> pd.DataFrame:
+    """Collapse one-row-per-nodule catalog to one row per scan."""
     return (
         catalog
         .groupby('series_uid', sort=False)
@@ -55,6 +70,7 @@ def _aggregate_to_scan(catalog: pd.DataFrame) -> pd.DataFrame:
 
 
 def _aggregate_to_patient(per_scan: pd.DataFrame) -> pd.DataFrame:
+    """Collapse to one row per patient (handles multi-scan patients)."""
     return (
         per_scan
         .groupby('patient_id', sort=False)
@@ -67,46 +83,17 @@ def _aggregate_to_patient(per_scan: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _assign_bins(df: pd.DataFrame, col: str, n: int) -> pd.Series:
-    """Quantile-bin a column; fall back to rank bins if duplicate edges exist."""
+def _assign_bins(series: pd.Series, n: int) -> pd.Series:
+    """Quantile-bin a series; fall back to rank-based cut on duplicate edges."""
     try:
-        return pd.qcut(df[col], q=n, labels=False, duplicates='drop')
+        return pd.qcut(series, q=n, labels=False, duplicates='drop')
     except ValueError:
-        return pd.qcut(df[col].rank(method='first'), q=n, labels=False)
+        return pd.qcut(series.rank(method='first'), q=n, labels=False)
 
 
-def _stratified_sample(
-    patients: pd.DataFrame,
-    n: int,
-    rng: np.random.Generator,
-) -> pd.Index:
-    """Sample n patients stratified by (volume_bin, entropy_bin).
-
-    Falls back to proportional random sampling if strata are too sparse.
-    """
-    if len(patients) <= n:
-        return patients.index
-
-    strata   = patients.groupby(['volume_bin', 'entropy_bin'], observed=True)
-    total    = len(patients)
-    selected = []
-
-    for _, group in strata:
-        quota = max(1, round(n * len(group) / total))
-        quota = min(quota, len(group))
-        selected.extend(rng.choice(group.index, size=quota, replace=False).tolist())
-
-    # Adjust to hit exactly n (rounding may leave us ±a few)
-    selected = list(dict.fromkeys(selected))   # deduplicate, preserve order
-    if len(selected) < n:
-        remaining = patients.index.difference(selected)
-        extra = rng.choice(remaining, size=n - len(selected), replace=False)
-        selected.extend(extra.tolist())
-    elif len(selected) > n:
-        selected = rng.choice(selected, size=n, replace=False).tolist()
-
-    return pd.Index(selected)
-
+# ---------------------------------------------------------------------------
+# Core logic
+# ---------------------------------------------------------------------------
 
 def generate_split(
     catalog_csv: str,
@@ -129,34 +116,89 @@ def generate_split(
             test_size, NLST_RADIOLOGIST_CAP, BALANCE_WARNING_SIZE, NLST_RADIOLOGIST_CAP,
         )
 
+    rng = np.random.default_rng(seed)
+
+    # --- Aggregate catalog rows to one row per patient ---
     per_scan    = _aggregate_to_scan(catalog)
     per_patient = _aggregate_to_patient(per_scan)
 
+    # --- Restrict to test-eligible patients ---
     eligible = per_patient[per_patient['dataset'].isin(TEST_ELIGIBLE_DATASETS)].copy()
+    if eligible.empty:
+        raise ValueError('No test-eligible patients found in the catalog.')
 
-    # Compute bins across the full eligible pool for globally consistent edges.
-    eligible['volume_bin']  = _assign_bins(eligible, 'median_volume', N_QUANTILE_BINS)
-    eligible['entropy_bin'] = _assign_bins(eligible, 'mean_entropy',  N_QUANTILE_BINS)
+    # --- Bin volume and entropy across the COMBINED eligible pool ---
+    # Bins are global so the same cell means the same thing across datasets.
+    eligible['volume_bin']  = _assign_bins(eligible['median_volume'], N_QUANTILE_BINS)
+    eligible['entropy_bin'] = _assign_bins(eligible['mean_entropy'],  N_QUANTILE_BINS)
 
-    rng            = np.random.default_rng(seed)
-    per_ds_quota   = test_size // 3
-    test_patients  = []
+    # --- Compute proportional quota for each (volume_bin, entropy_bin, dataset) cell ---
+    # Each cell gets a quota proportional to its fraction of the eligible pool.
+    total_eligible = len(eligible)
+    cells = eligible.groupby(['volume_bin', 'entropy_bin', 'dataset'], observed=True)
 
-    for ds in sorted(TEST_ELIGIBLE_DATASETS):
-        pool  = eligible[eligible['dataset'] == ds]
-        quota = min(per_ds_quota, NLST_RADIOLOGIST_CAP if ds == 'nlst_radiologist' else len(pool))
-        quota = min(quota, len(pool))
-        if quota == 0:
-            _logger.warning('No eligible patients found for dataset "%s".', ds)
+    cell_quotas = {}
+    for key, group in cells:
+        cell_quotas[key] = round(test_size * len(group) / total_eligible)
+
+    # --- Enforce the NLST radiologist cap ---
+    # If the sum of NLST cell quotas exceeds 102, scale them down proportionally
+    # and redistribute the freed slots to non-NLST cells.
+    nlst_keys     = [k for k in cell_quotas if k[2] == 'nlst_radiologist']
+    non_nlst_keys = [k for k in cell_quotas if k[2] != 'nlst_radiologist']
+
+    total_nlst_quota = sum(cell_quotas[k] for k in nlst_keys)
+    if total_nlst_quota > NLST_RADIOLOGIST_CAP:
+        freed = total_nlst_quota - NLST_RADIOLOGIST_CAP
+
+        # Scale NLST quotas down proportionally.
+        for k in nlst_keys:
+            cell_quotas[k] = round(cell_quotas[k] * NLST_RADIOLOGIST_CAP / total_nlst_quota)
+
+        # Redistribute freed slots to non-NLST cells proportionally.
+        non_nlst_total = sum(cell_quotas[k] for k in non_nlst_keys)
+        if non_nlst_total > 0:
+            for k in non_nlst_keys:
+                cell_quotas[k] += round(freed * cell_quotas[k] / non_nlst_total)
+
+    # --- Sample from each cell ---
+    test_selected = []
+    for key, group in cells:
+        quota = min(cell_quotas[key], len(group))
+        if quota <= 0:
             continue
-        selected = _stratified_sample(pool, quota, rng)
-        test_patients.extend(selected.tolist())
-        _logger.info('Selected %d / %d patients from %s for test.', len(selected), len(pool), ds)
+        chosen = rng.choice(group['patient_id'].values, size=quota, replace=False)
+        test_selected.extend(chosen.tolist())
 
-    test_patient_set = set(test_patients)
+    # --- Rounding adjustment ---
+    # Cell quotas are independently rounded so their sum may differ from
+    # test_size by a small amount.  Adjust randomly while respecting the cap.
+    test_selected = list(dict.fromkeys(test_selected))   # deduplicate
 
-    # Assign split at the scan level, including all datasets (training pool
-    # contains nlst_ai and non-selected scans from the other datasets).
+    if len(test_selected) > test_size:
+        test_selected = rng.choice(test_selected, size=test_size, replace=False).tolist()
+
+    elif len(test_selected) < test_size:
+        nlst_used = sum(
+            1 for pid in test_selected
+            if eligible.loc[eligible['patient_id'] == pid, 'dataset'].iloc[0] == 'nlst_radiologist'
+        )
+        remaining = eligible[~eligible['patient_id'].isin(test_selected)]
+        # Respect the NLST cap when filling remaining slots.
+        if nlst_used >= NLST_RADIOLOGIST_CAP:
+            remaining = remaining[remaining['dataset'] != 'nlst_radiologist']
+        gap   = min(test_size - len(test_selected), len(remaining))
+        extra = rng.choice(remaining['patient_id'].values, size=gap, replace=False)
+        test_selected.extend(extra.tolist())
+
+    test_patient_set = set(test_selected)
+
+    # --- Log breakdown by dataset ---
+    selected_patients = eligible[eligible['patient_id'].isin(test_patient_set)]
+    for ds, grp in selected_patients.groupby('dataset', observed=True):
+        _logger.info('Test set — %s: %d patients', ds, len(grp))
+
+    # --- Assign split to every scan (including nlst_ai and non-selected scans) ---
     per_scan['split'] = per_scan['patient_id'].apply(
         lambda pid: 'test' if pid in test_patient_set else 'train'
     )
@@ -187,7 +229,7 @@ def main():
         description='Generate a stratified train/test split from a nodule catalog.',
         epilog='The catalog CSV is produced by running the processing pipeline.',
     )
-    parser.add_argument('catalog',    help='Path to nodule_catalog.csv')
+    parser.add_argument('catalog',     help='Path to nodule_catalog.csv')
     parser.add_argument('--test-size', type=int, default=BALANCE_WARNING_SIZE,
                         help=f'Total number of scans in the test set (default: {BALANCE_WARNING_SIZE})')
     parser.add_argument('--seed',      type=int, default=42,

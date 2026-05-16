@@ -264,9 +264,11 @@ class NoduleAnomalyFilterTransform(PipelinePart):
                  if data.get('ct') is not None else None)
 
         filtered = []
+        total_components = 0
         for seg in seg_list:
             mask       = seg[0].cpu().numpy().astype(bool)
             labeled, n = ndi.label(mask, structure=self._STRUCTURE)
+            total_components += n
             clean      = np.zeros_like(mask)
             for lbl in range(1, n + 1):
                 comp = labeled == lbl
@@ -282,8 +284,12 @@ class NoduleAnomalyFilterTransform(PipelinePart):
             ))
 
         if all(not f[0].any() for f in filtered):
+            if total_components == 0:
+                raise DataAnomalyError(
+                    'Nodule segmentation mask is empty (no annotated voxels). Series dropped.'
+                )
             raise DataAnomalyError(
-                'All nodule components removed by anomaly filter '
+                f'All {total_components} nodule component(s) removed by anomaly filter '
                 '(volume or mean HU out of range). Series dropped.'
             )
 

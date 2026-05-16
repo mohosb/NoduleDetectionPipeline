@@ -224,7 +224,7 @@ class NIfTIWriter(PipelinePart):
         nib.save(img, path)
 
 
-_CATALOG_COLUMNS = ['patient_id', 'series_uid', 'dataset', 'nodule_id', 'volume_mm3', 'entropy']
+_CATALOG_COLUMNS = ['patient_id', 'series_uid', 'dataset', 'volume_mm3', 'entropy']
 
 
 def _nodule_entropy(
@@ -237,7 +237,7 @@ def _nodule_entropy(
     counts, _ = np.histogram(ct_voxels, bins=n_bins, range=(0.0, 1.0))
     p = counts / counts.sum()
     p = p[p > 0]
-    return float(-np.sum(p * np.log2(p)))
+    return abs(float(-np.sum(p * np.log2(p))))
 
 
 class NoduleCatalogWriter(PipelinePart):
@@ -286,7 +286,10 @@ class NoduleCatalogWriter(PipelinePart):
 
         seg_arr = seg_data.cpu().numpy()          # (1, H, W, D)
         ct_arr  = ct_data.cpu().numpy()           # (1, H, W, D)
-        spacing = np.array(seg_data.meta.get('pixdim', [1, 1, 1, 1])[1:4], dtype=float)
+        # Read spacing from the affine — this reflects the actual resampled
+        # spacing, unlike meta['pixdim'] which retains the original DICOM value.
+        affine       = seg_data.affine.cpu().numpy()
+        spacing      = np.linalg.norm(affine[:3, :3], axis=0)
         voxel_volume = float(np.prod(spacing))
 
         mask_3d = seg_arr[0]                      # (H, W, D)
@@ -301,7 +304,7 @@ class NoduleCatalogWriter(PipelinePart):
             nodule_masks = [(nid, labeled == nid) for nid in range(1, n + 1)]
 
         rows = []
-        for nodule_id, mask in nodule_masks:
+        for local_label, mask in nodule_masks:
             voxel_count = int(mask.sum())
             if voxel_count == 0:
                 continue
@@ -311,7 +314,6 @@ class NoduleCatalogWriter(PipelinePart):
                 'patient_id': patient_id,
                 'series_uid': series_uid,
                 'dataset':    self._dataset,
-                'nodule_id':  int(nodule_id),
                 'volume_mm3': round(volume, 4),
                 'entropy':    round(entropy, 6),
             })
@@ -324,6 +326,11 @@ class NoduleCatalogWriter(PipelinePart):
         with open(self._catalog_path, 'a', newline='') as f:
             fcntl.flock(f, fcntl.LOCK_EX)
             try:
+                # Seek to true end after acquiring the lock — f.tell() at open
+                # time reflects the file size when this process opened it, not
+                # the current size, so two workers opening an empty file would
+                # both see 0 and both write the header without this seek.
+                f.seek(0, 2)
                 writer = csv.DictWriter(f, fieldnames=_CATALOG_COLUMNS)
                 if f.tell() == 0:
                     writer.writeheader()

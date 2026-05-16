@@ -298,6 +298,9 @@ def setup_logging(log_dir: str, dataset: str, outputs: list, log_queue=None):
     logger = logging.getLogger('pipeline')
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
+    for h in logger.handlers[:]:
+        h.close()
+    logger.handlers.clear()
     logger.addHandler(fh)
     logger.addHandler(ch)
     logger.info(f'Logging to {log_file}')
@@ -394,8 +397,12 @@ DEFAULTS = {
     # HU windowing applied before normalisation
     'hu_clip_min':         -1000.0,
     'hu_clip_max':         400.0,
-    # Nodule catalog — None disables catalog writing
-    'catalog_path':        None,     # defaults to <save_path>/nodule_catalog.csv when omitted
+    # Nodule catalog output path. Defaults to <save_path>/nodule_catalog.csv.
+    # Note: the catalog is only written for series that are processed in the
+    # current run. Series skipped by the already_processed() check (reprocess=false)
+    # will not appear in the catalog. To rebuild a catalog from scratch, delete
+    # the catalog file and re-run with reprocess=true.
+    'catalog_path':        None,
 }
 
 
