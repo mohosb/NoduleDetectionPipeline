@@ -3,7 +3,7 @@ Generate a stratified train/test split from a nodule catalog CSV.
 
 The catalog is produced automatically by the processing pipeline (via
 NoduleCatalogWriter) and contains one row per nodule with columns:
-  patient_id, series_uid, dataset, nodule_id, volume_mm3, entropy
+  patient_id, series_uid, dataset, volume_mm3, entropy
 
 Test set eligibility:
   - lidc_idri        all scans

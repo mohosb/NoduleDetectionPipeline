@@ -267,7 +267,7 @@ def build_pipeline(
             for sf in save_formats:
                 parts.append(make_writer(seg_dir, sm, sf, 'nodule_seg'))
 
-    # --- Nodule catalog (runs last so it sees instance labels if available) ---
+    # --- Nodule catalog (reads from params['nodule_components'], not nodule_seg) ---
     if catalog_path is not None and has_nodule:
         parts.append(NoduleCatalogWriter(
             catalog_path=catalog_path,

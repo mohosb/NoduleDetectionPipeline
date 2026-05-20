@@ -266,11 +266,12 @@ class NoduleStatsTransform(PipelinePart):
         self._n_bins = round((hu_clip_max - hu_clip_min) / bin_width_hu)
 
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
-        seg = data.get('nodule_seg')
-        if seg is None:
+        seg    = data.get('nodule_seg')
+        ct_data = data.get('ct')
+        if seg is None or ct_data is None:
             return data, params
 
-        ct_np   = data['ct'][0].cpu().numpy().astype(np.float32)
+        ct_np   = ct_data[0].cpu().numpy().astype(np.float32)
         mask_np = seg[0].cpu().numpy()
 
         affine       = seg.affine.cpu().numpy()
@@ -378,6 +379,8 @@ class NoduleHUFilterTransform(PipelinePart):
         hu_clip_min: float = -1000.0,
         hu_clip_max: float = 400.0,
     ):
+        self._min_hu      = min_hu
+        self._max_hu      = max_hu
         hu_range          = hu_clip_max - hu_clip_min
         self._min_hu_norm = (min_hu - hu_clip_min) / hu_range
         self._max_hu_norm = (max_hu - hu_clip_min) / hu_range
@@ -399,8 +402,7 @@ class NoduleHUFilterTransform(PipelinePart):
         if not passing:
             raise DataAnomalyError(
                 f'All {len(stats)} nodule component(s) removed by HU filter '
-                f'(mean HU outside [{self._min_hu_norm:.3f}, {self._max_hu_norm:.3f}] '
-                'normalised). Series dropped.'
+                f'(mean HU outside [{self._min_hu}, {self._max_hu}] HU). Series dropped.'
             )
 
         if len(passing) < len(stats):
