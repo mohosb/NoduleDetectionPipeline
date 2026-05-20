@@ -21,7 +21,7 @@ Full config with shared defaults and multiple runs (YAML):
       save_format:    numpy
       compress:       false
       label_type:     instance
-      anomaly_filter: true
+      volume_filter: true
 
     runs:
       - dataset: lidc_idri
@@ -64,9 +64,12 @@ from ct_data_management.processing.transforms import (
     ResampleTransform,
     LungDilationTransform,
     ROICropTransform,
-    NoduleAnomalyFilterTransform,
     MergeSegmentsTransform,
     HUClipAndNormTransform,
+    NoduleStatsTransform,
+    NoduleVolumeFilterTransform,
+    NoduleHUFilterTransform,
+    NoduleEntropyFilterTransform,
     ComputeROITransform,
     ToDeviceTransform,
     NoduleInstanceSegTransform,
@@ -133,42 +136,37 @@ def _process_series(args):
 
 # --- Pipeline builder ---
 
-def build_pipeline(save_path: str,
-                   nodule_labels: list,
-                   lung_labels: list,
-                   outputs: list,
-                   dataset: str = '',
-                   nodule_save_modes: list = None,
-                   lung_save_modes: list = None,
-                   roi_save_modes: list = None,
-                   save_formats: list = None,
-                   compress: bool = True,
-                   device: str = 'cpu',
-                   viewer: bool = False,
-                   label_types: list = None,
-                   lung_dilations: int = 0,
-                   roi_crop: bool = False,
-                   roi_padding: int = 1,
-                   anomaly_filter: bool = False,
-                   anomaly_min_size: float = float('-inf'),
-                   anomaly_max_size: float = float('inf'),
-                   anomaly_min_hu: float = float('-inf'),
-                   anomaly_max_hu: float = float('inf'),
-                   hu_clip_min: float = -1000.0,
-                   hu_clip_max: float = 400.0,
-                   catalog_path: str = None):
-
-    if nodule_save_modes is None:
-        nodule_save_modes = ['3d']
-    if lung_save_modes is None:
-        lung_save_modes = ['3d']
-    if roi_save_modes is None:
-        roi_save_modes = ['3d']
-    if save_formats is None:
-        save_formats = ['numpy']
-    if label_types is None:
-        label_types = ['semantic']
-
+def build_pipeline(
+    *,
+    save_path: str,
+    dataset: str,
+    nodule_labels: list,
+    lung_labels: list,
+    outputs: list,
+    nodule_save_modes: list,
+    lung_save_modes: list,
+    roi_save_modes: list,
+    save_formats: list,
+    compress: bool,
+    device: str,
+    viewer: bool,
+    label_types: list,
+    lung_dilations: int,
+    roi_crop: bool,
+    roi_padding: int,
+    volume_filter: bool,
+    volume_min: float,
+    volume_max: float,
+    hu_filter: bool,
+    hu_min: float,
+    hu_max: float,
+    entropy_filter: bool,
+    entropy_min: float,
+    entropy_max: float,
+    hu_clip_min: float,
+    hu_clip_max: float,
+    catalog_path: str,
+):
     parts = [DICOMFileSystemReader(return_headers=True, dtype=torch.float16)]
 
     if device != 'cpu':
@@ -187,14 +185,6 @@ def build_pipeline(save_path: str,
     if roi_crop:
         parts.append(ROICropTransform(padding=roi_padding))
 
-    if anomaly_filter:
-        parts.append(NoduleAnomalyFilterTransform(
-            min_voxels=anomaly_min_size,
-            max_voxels=anomaly_max_size,
-            min_hu=anomaly_min_hu,
-            max_hu=anomaly_max_hu,
-        ))
-
     parts += [
         MergeSegmentsTransform(),
         HUClipAndNormTransform(clip_min=hu_clip_min, clip_max=hu_clip_max),
@@ -203,11 +193,31 @@ def build_pipeline(save_path: str,
     if device != 'cpu':
         parts.append(ToDeviceTransform(device='cpu'))
 
+    has_nodule = 'nodule' in outputs
+
+    # NoduleStatsTransform always runs when nodule output is requested so that
+    # filters and the catalog writer share a single connected-component analysis.
+    if has_nodule:
+        parts.append(NoduleStatsTransform(hu_clip_min=hu_clip_min, hu_clip_max=hu_clip_max))
+
+        if volume_filter:
+            parts.append(NoduleVolumeFilterTransform(min_volume=volume_min, max_volume=volume_max))
+
+        if hu_filter:
+            parts.append(NoduleHUFilterTransform(
+                min_hu=hu_min,
+                max_hu=hu_max,
+                hu_clip_min=hu_clip_min,
+                hu_clip_max=hu_clip_max,
+            ))
+
+        if entropy_filter:
+            parts.append(NoduleEntropyFilterTransform(min_entropy=entropy_min, max_entropy=entropy_max))
+
     if viewer:
         parts.append(InteractiveViewer())
         return PipelineStack(parts)
 
-    has_nodule   = 'nodule' in outputs
     has_lung     = 'lung'   in outputs
     has_roi      = 'roi'    in outputs
     has_semantic = 'semantic' in label_types
@@ -262,8 +272,6 @@ def build_pipeline(save_path: str,
         parts.append(NoduleCatalogWriter(
             catalog_path=catalog_path,
             dataset=dataset,
-            hu_clip_min=hu_clip_min,
-            hu_clip_max=hu_clip_max,
         ))
 
     return PipelineStack(parts)
@@ -389,11 +397,15 @@ DEFAULTS = {
     'lung_dilations':      0,           # dilation iterations on lung mask (0 = disabled)
     'roi_crop':            False,
     'roi_padding':         1,           # voxels of padding around ROI crop bounding box
-    'anomaly_filter':      False,
-    'anomaly_min_size':    float('-inf'),
-    'anomaly_max_size':    float('inf'),
-    'anomaly_min_hu':      float('-inf'),
-    'anomaly_max_hu':      float('inf'),
+    'volume_filter':       True,
+    'volume_min':          5.0,
+    'volume_max':          float('inf'),
+    'hu_filter':           False,
+    'hu_min':              float('-inf'),
+    'hu_max':              float('inf'),
+    'entropy_filter':      False,
+    'entropy_min':         float('-inf'),
+    'entropy_max':         float('inf'),
     # HU windowing applied before normalisation
     'hu_clip_min':         -1000.0,
     'hu_clip_max':         400.0,
@@ -490,8 +502,8 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
         err('"instance" label_type requires output to include "nodule".')
     if (cfg['roi_crop'] or cfg['lung_dilations'] > 0) and lung_labels is None:
         err('"roi_crop" and "lung_dilations" require lung annotations.')
-    if cfg['anomaly_filter'] and 'nodule' not in outputs:
-        err('"anomaly_filter" requires output to include "nodule".')
+    if any(cfg[f] for f in ('volume_filter', 'hu_filter', 'entropy_filter')) and 'nodule' not in outputs:
+        err('"volume_filter", "hu_filter", and "entropy_filter" require output to include "nodule".')
 
     raw_path  = os.path.join(cfg['raw_data_path'], dataset)
     save_path = cfg['save_path'] or os.path.join(cfg['processed_data_path'], dataset)
@@ -521,11 +533,15 @@ def run_one(cfg: dict, run_index: int, total_runs: int) -> None:
         lung_dilations=cfg['lung_dilations'],
         roi_crop=cfg['roi_crop'],
         roi_padding=cfg['roi_padding'],
-        anomaly_filter=cfg['anomaly_filter'],
-        anomaly_min_size=cfg['anomaly_min_size'],
-        anomaly_max_size=cfg['anomaly_max_size'],
-        anomaly_min_hu=cfg['anomaly_min_hu'],
-        anomaly_max_hu=cfg['anomaly_max_hu'],
+        volume_filter=cfg['volume_filter'],
+        volume_min=cfg['volume_min'],
+        volume_max=cfg['volume_max'],
+        hu_filter=cfg['hu_filter'],
+        hu_min=cfg['hu_min'],
+        hu_max=cfg['hu_max'],
+        entropy_filter=cfg['entropy_filter'],
+        entropy_min=cfg['entropy_min'],
+        entropy_max=cfg['entropy_max'],
         hu_clip_min=cfg['hu_clip_min'],
         hu_clip_max=cfg['hu_clip_max'],
         catalog_path=catalog_path,

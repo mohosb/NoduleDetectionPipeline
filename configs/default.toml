@@ -38,12 +38,19 @@ viewer        = false  # launch interactive viewer instead of writing files
 hu_clip_min = -1000.0
 hu_clip_max  =   400.0
 
-# Anomaly filtering (thresholds in mm³ and HU; use -inf / inf to disable a bound)
-anomaly_filter   = true
-anomaly_min_size = -inf
-anomaly_max_size =  inf
-anomaly_min_hu   = -inf
-anomaly_max_hu   =  inf
+# Nodule filtering — each filter is independent and optional
+# Volume (mm³ ≈ voxel count after 1×1×1 mm resampling; use -inf / inf to disable a bound)
+volume_filter = true
+volume_min    = 5.0
+volume_max    = inf
+# Mean HU of the component (raw HU units; use -inf / inf to disable a bound)
+hu_filter = false
+hu_min    = -inf
+hu_max    =  inf
+# Shannon entropy in bits (use -inf / inf to disable a bound)
+entropy_filter = false
+entropy_min    = -inf
+entropy_max    =  inf
 
 # Morphological / crop hyperparameters
 lung_dilations = 0      # dilation iterations on lung mask (0 = disabled)

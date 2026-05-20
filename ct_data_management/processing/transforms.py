@@ -223,77 +223,249 @@ class ROICropTransform(PipelinePart):
         return data, params
 
 
-class NoduleAnomalyFilterTransform(PipelinePart):
-    """Remove nodule annotation components outside plausible size and HU ranges.
+class NoduleStatsTransform(PipelinePart):
+    """Compute per-nodule volume and entropy statistics after merging and normalisation.
 
-    Operates on ``data['nodule_seg_list']`` before the masks are merged.  For each
-    mask entry the transform runs 3D connected-component labelling (26-connectivity)
-    and independently checks each component against two criteria:
+    Performs 26-connectivity connected-component analysis on ``data['nodule_seg']``
+    and stores per-component statistics in ``params['nodule_components']``::
 
-    1. **Volume** — component voxel count must be in ``[min_voxels, max_voxels]``.
-       After resampling to 1 × 1 × 1 mm, voxel count ≈ volume in mm³.
-    2. **Mean HU** — mean CT value of voxels in the component must be in
-       ``[min_hu, max_hu]``.  This check uses ``data['ct']`` which still holds raw
-       HU values at this stage (before ``HUClipAndNormTransform``).
+        {
+            'labeled': np.ndarray,    # (H, W, D) integer component labels
+            'stats': [
+                {
+                    'label':        int,    # component label in 'labeled'
+                    'volume_mm3':   float,
+                    'entropy':      float,  # Shannon entropy in bits
+                    'mean_hu_norm': float,  # mean normalised CT value in [0, 1]
+                },
+                ...
+            ]
+        }
 
-    Raises ``DataAnomalyError`` if every component across all entries is removed,
-    since empty output files are not acceptable.
+    This transform is the single source of per-nodule statistics.  Downstream
+    filter transforms (``NoduleVolumeFilterTransform``, ``NoduleHUFilterTransform``, ``NoduleEntropyFilterTransform``)
+    and ``NoduleCatalogWriter`` all read from ``params['nodule_components']`` rather
+    than deriving statistics independently.
 
-    Default thresholds (adjust after medical expert review):
-        min_voxels  =    14.0   ≈ 3 mm Ø sphere (Fleischner lower bound)
-        max_voxels  = 14137.0   ≈ 30 mm Ø sphere (Fleischner nodule–mass boundary)
-        min_hu      =  -800.0   below ground-glass range; excludes air artefacts
-        max_hu      =   700.0   above calcified nodules; excludes dense cortical bone
+    Must be placed after both ``MergeSegmentsTransform`` and ``HUClipAndNormTransform``.
+
+    Args:
+        hu_clip_min:  Lower HU bound used during normalisation (default −1000).
+        hu_clip_max:  Upper HU bound used during normalisation (default  400).
+        bin_width_hu: Histogram bin width in HU for entropy (default 25).
     """
 
     _STRUCTURE = ndi.generate_binary_structure(3, 3)   # 26-connectivity
 
-    def __init__(self, min_voxels=float('-inf'), max_voxels=float('inf'),
-                 min_hu=float('-inf'), max_hu=float('inf')):
-        self._min_vol = min_voxels
-        self._max_vol = max_voxels
-        self._min_hu  = min_hu
-        self._max_hu  = max_hu
+    def __init__(
+        self,
+        hu_clip_min: float = -1000.0,
+        hu_clip_max: float = 400.0,
+        bin_width_hu: float = 25.0,
+    ):
+        self._n_bins = round((hu_clip_max - hu_clip_min) / bin_width_hu)
 
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
-        seg_list = data.get('nodule_seg_list')
-        if not seg_list:
+        seg = data.get('nodule_seg')
+        if seg is None:
             return data, params
 
-        ct_np = (data['ct'][0].cpu().numpy().astype(np.float32)
-                 if data.get('ct') is not None else None)
+        ct_np   = data['ct'][0].cpu().numpy().astype(np.float32)
+        mask_np = seg[0].cpu().numpy()
 
-        filtered = []
-        total_components = 0
-        for seg in seg_list:
-            mask       = seg[0].cpu().numpy().astype(bool)
-            labeled, n = ndi.label(mask, structure=self._STRUCTURE)
-            total_components += n
-            clean      = np.zeros_like(mask)
-            for lbl in range(1, n + 1):
-                comp = labeled == lbl
-                if not (self._min_vol <= int(comp.sum()) <= self._max_vol):
-                    continue
-                if ct_np is not None:
-                    if not (self._min_hu <= float(ct_np[comp].mean()) <= self._max_hu):
-                        continue
-                clean |= comp
-            filtered.append(MetaTensor(
-                torch.from_numpy(clean).unsqueeze(0).to(seg.dtype),
-                meta=seg.meta,
-            ))
+        affine       = seg.affine.cpu().numpy()
+        spacing      = np.linalg.norm(affine[:3, :3], axis=0)
+        voxel_volume = float(np.prod(spacing))
 
-        if all(not f[0].any() for f in filtered):
-            if total_components == 0:
-                raise DataAnomalyError(
-                    'Nodule segmentation mask is empty (no annotated voxels). Series dropped.'
-                )
+        labeled, n = ndi.label(mask_np > 0, structure=self._STRUCTURE)
+
+        stats = []
+        for lbl in range(1, n + 1):
+            comp        = labeled == lbl
+            voxel_count = int(comp.sum())
+            if voxel_count == 0:
+                continue
+            ct_voxels = ct_np[comp]
+            counts, _ = np.histogram(ct_voxels, bins=self._n_bins, range=(0.0, 1.0))
+            p         = counts / counts.sum()
+            p         = p[p > 0]
+            entropy   = abs(float(-np.sum(p * np.log2(p))))
+            stats.append({
+                'label':        lbl,
+                'volume_mm3':   round(voxel_count * voxel_volume, 4),
+                'entropy':      round(entropy, 6),
+                'mean_hu_norm': float(ct_voxels.mean()),
+            })
+
+        params['nodule_components'] = {'labeled': labeled, 'stats': stats}
+        return data, params
+
+
+class NoduleVolumeFilterTransform(PipelinePart):
+    """Remove nodule components outside a plausible volume range.
+
+    Reads and updates ``params['nodule_components']`` populated by
+    ``NoduleStatsTransform``, so it must be placed after that transform.
+
+    Thresholds are in mm³.  After resampling to 1 × 1 × 1 mm spacing,
+    volume_mm3 ≈ voxel count.
+
+    Raises ``DataAnomalyError`` if every component is removed by the filter.
+
+    Suggested thresholds (adjust after medical expert review):
+        min_volume =    14.0   ≈ 3 mm Ø sphere (Fleischner lower bound)
+        max_volume = 14137.0   ≈ 30 mm Ø sphere (Fleischner nodule–mass boundary)
+    """
+
+    def __init__(
+        self,
+        min_volume: float = float('-inf'),
+        max_volume: float = float('inf'),
+    ):
+        self._min = min_volume
+        self._max = max_volume
+
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        components = params.get('nodule_components')
+        if not components or not components['stats']:
+            return data, params
+
+        stats   = components['stats']
+        labeled = components['labeled']
+        seg     = data['nodule_seg']
+
+        passing = [s for s in stats if self._min <= s['volume_mm3'] <= self._max]
+
+        if not passing:
             raise DataAnomalyError(
-                f'All {total_components} nodule component(s) removed by anomaly filter '
-                '(volume or mean HU out of range). Series dropped.'
+                f'All {len(stats)} nodule component(s) removed by volume filter '
+                f'(volume outside [{self._min}, {self._max}] mm³). Series dropped.'
             )
 
-        data['nodule_seg_list'] = filtered
+        if len(passing) < len(stats):
+            keeping  = {s['label'] for s in passing}
+            new_mask = np.isin(labeled, list(keeping))
+            data['nodule_seg'] = MetaTensor(
+                torch.from_numpy(new_mask).unsqueeze(0).to(seg.dtype),
+                meta=seg.meta,
+            )
+            params['nodule_components'] = {'labeled': labeled, 'stats': passing}
+
+        return data, params
+
+
+class NoduleHUFilterTransform(PipelinePart):
+    """Remove nodule components outside a plausible mean HU range.
+
+    Reads and updates ``params['nodule_components']`` populated by
+    ``NoduleStatsTransform``, so it must be placed after that transform.
+
+    ``min_hu`` / ``max_hu`` are in raw HU units and are converted to the
+    normalised [0, 1] scale internally using ``hu_clip_min`` / ``hu_clip_max``,
+    so they are directly comparable to the ``mean_hu_norm`` values in the stats.
+
+    Raises ``DataAnomalyError`` if every component is removed by the filter.
+
+    Suggested thresholds (adjust after medical expert review):
+        min_hu = -800.0   below ground-glass range; excludes air artefacts
+        max_hu =  700.0   above calcified nodules; excludes dense cortical bone
+    """
+
+    def __init__(
+        self,
+        min_hu: float = float('-inf'),
+        max_hu: float = float('inf'),
+        hu_clip_min: float = -1000.0,
+        hu_clip_max: float = 400.0,
+    ):
+        hu_range          = hu_clip_max - hu_clip_min
+        self._min_hu_norm = (min_hu - hu_clip_min) / hu_range
+        self._max_hu_norm = (max_hu - hu_clip_min) / hu_range
+
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        components = params.get('nodule_components')
+        if not components or not components['stats']:
+            return data, params
+
+        stats   = components['stats']
+        labeled = components['labeled']
+        seg     = data['nodule_seg']
+
+        passing = [
+            s for s in stats
+            if self._min_hu_norm <= s['mean_hu_norm'] <= self._max_hu_norm
+        ]
+
+        if not passing:
+            raise DataAnomalyError(
+                f'All {len(stats)} nodule component(s) removed by HU filter '
+                f'(mean HU outside [{self._min_hu_norm:.3f}, {self._max_hu_norm:.3f}] '
+                'normalised). Series dropped.'
+            )
+
+        if len(passing) < len(stats):
+            keeping  = {s['label'] for s in passing}
+            new_mask = np.isin(labeled, list(keeping))
+            data['nodule_seg'] = MetaTensor(
+                torch.from_numpy(new_mask).unsqueeze(0).to(seg.dtype),
+                meta=seg.meta,
+            )
+            params['nodule_components'] = {'labeled': labeled, 'stats': passing}
+
+        return data, params
+
+
+class NoduleEntropyFilterTransform(PipelinePart):
+    """Remove nodule components whose Shannon entropy falls outside a given range.
+
+    Reads and updates ``params['nodule_components']`` populated by
+    ``NoduleStatsTransform``, so it must be placed after that transform.
+
+    Entropy values match those written to the nodule catalog by
+    ``NoduleCatalogWriter``, so thresholds can be derived directly from
+    catalog analysis.
+
+    Raises ``DataAnomalyError`` if every component is removed by the filter.
+
+    Args:
+        min_entropy: Lower entropy bound in bits (inclusive).  Default −∞.
+        max_entropy: Upper entropy bound in bits (inclusive).  Default +∞.
+    """
+
+    def __init__(
+        self,
+        min_entropy: float = float('-inf'),
+        max_entropy: float = float('inf'),
+    ):
+        self._min = min_entropy
+        self._max = max_entropy
+
+    def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
+        components = params.get('nodule_components')
+        if not components or not components['stats']:
+            return data, params
+
+        stats   = components['stats']
+        labeled = components['labeled']
+        seg     = data['nodule_seg']
+
+        passing = [s for s in stats if self._min <= s['entropy'] <= self._max]
+
+        if not passing:
+            raise DataAnomalyError(
+                f'All {len(stats)} nodule component(s) removed by entropy filter '
+                f'(entropy outside [{self._min}, {self._max}] bits). Series dropped.'
+            )
+
+        if len(passing) < len(stats):
+            keeping  = {s['label'] for s in passing}
+            new_mask = np.isin(labeled, list(keeping))
+            data['nodule_seg'] = MetaTensor(
+                torch.from_numpy(new_mask).unsqueeze(0).to(seg.dtype),
+                meta=seg.meta,
+            )
+            params['nodule_components'] = {'labeled': labeled, 'stats': passing}
+
         return data, params
 
 

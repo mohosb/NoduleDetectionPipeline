@@ -7,10 +7,10 @@ run entry, only the fields relevant to cataloging are used:
     dataset, raw_data_path, processed_data_path, save_path,
     hu_clip_min, hu_clip_max, catalog_path
 
-All output, save_format, label_type, anomaly_filter, and writer settings
-are ignored.  No anomaly filtering is applied so every annotated nodule
+All output, save_format, label_type, and writer settings are ignored.
+No filters (volume, HU, entropy) are applied so every annotated nodule
 component is recorded, including small artefacts — the point is to analyse
-the full size distribution before choosing filter thresholds.
+the full distribution before choosing filter thresholds.
 
 Usage:
     python catalog_nodules.py configs/default.toml
@@ -36,6 +36,7 @@ from ct_data_management.processing.transforms import (
     ResampleTransform,
     MergeSegmentsTransform,
     HUClipAndNormTransform,
+    NoduleStatsTransform,
 )
 from ct_data_management.processing.writers import NoduleCatalogWriter
 from process import load_config, DEFAULTS, DATASET_CONFIGS, DATASET_SEG_CONFIGS
@@ -59,11 +60,10 @@ def build_pipeline(
         ResampleTransform(),
         MergeSegmentsTransform(),
         HUClipAndNormTransform(clip_min=hu_clip_min, clip_max=hu_clip_max),
+        NoduleStatsTransform(hu_clip_min=hu_clip_min, hu_clip_max=hu_clip_max),
         NoduleCatalogWriter(
             catalog_path=catalog_path,
             dataset=dataset,
-            hu_clip_min=hu_clip_min,
-            hu_clip_max=hu_clip_max,
         ),
     ])
 
@@ -134,7 +134,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         description='Build a nodule catalog CSV without writing any processed files.',
-        epilog='Uses the same config format as process.py. Anomaly filtering is not applied.',
+        epilog='Uses the same config format as process.py. No nodule filters are applied.',
     )
     parser.add_argument('config', help='Path to a YAML (.yaml/.yml) or TOML (.toml) config file.')
     args = parser.parse_args()

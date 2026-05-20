@@ -4,7 +4,6 @@ import fcntl
 import os
 import numpy as np
 import nibabel as nib
-import scipy.ndimage as ndi
 from .pipeline import PipelinePart
 
 
@@ -227,27 +226,12 @@ class NIfTIWriter(PipelinePart):
 _CATALOG_COLUMNS = ['patient_id', 'series_uid', 'dataset', 'volume_mm3', 'entropy']
 
 
-def _nodule_entropy(
-    ct_voxels: np.ndarray,
-    hu_clip_min: float,
-    hu_clip_max: float,
-    bin_width_hu: float = 25.0,
-) -> float:
-    n_bins = round((hu_clip_max - hu_clip_min) / bin_width_hu)
-    counts, _ = np.histogram(ct_voxels, bins=n_bins, range=(0.0, 1.0))
-    p = counts / counts.sum()
-    p = p[p > 0]
-    return abs(float(-np.sum(p * np.log2(p))))
-
-
 class NoduleCatalogWriter(PipelinePart):
     """Appends per-nodule statistics to a shared CSV catalog after each processed scan.
 
-    Reads the normalized CT (data['ct']) and the nodule segmentation mask
-    (data['nodule_seg']) that is present at the end of the pipeline.  If the
-    mask contains instance labels (max > 1) they are used directly; otherwise
-    connected-component analysis separates the binary mask into individual
-    nodules.
+    Reads pre-computed per-component statistics from ``params['nodule_components']``
+    as populated by ``NoduleStatsTransform``.  Must be placed after that transform
+    in the pipeline.
 
     The CSV is written with an exclusive POSIX file lock so concurrent worker
     processes can safely append to the same file.
@@ -256,26 +240,15 @@ class NoduleCatalogWriter(PipelinePart):
         catalog_path: Path to the output CSV file.
         dataset:      Dataset label written into every row ('lidc_idri',
                       'nsclc_radiomics', 'nlst_radiologist', or 'nlst_ai').
-        hu_clip_min:  Lower HU bound used during normalization (default -1000).
-        hu_clip_max:  Upper HU bound used during normalization (default  400).
     """
 
-    def __init__(
-        self,
-        catalog_path: str,
-        dataset: str,
-        hu_clip_min: float = -1000.0,
-        hu_clip_max: float = 400.0,
-    ):
+    def __init__(self, catalog_path: str, dataset: str):
         self._catalog_path = catalog_path
         self._dataset      = dataset
-        self._hu_clip_min  = hu_clip_min
-        self._hu_clip_max  = hu_clip_max
 
     def __call__(self, data: dict, params: dict) -> tuple[dict, dict]:
-        seg_data = data.get('nodule_seg')
-        ct_data  = data.get('ct')
-        if seg_data is None or ct_data is None:
+        components = params.get('nodule_components')
+        if not components or not components['stats']:
             return data, params
 
         series_uid = params.get('id', '')
@@ -284,42 +257,16 @@ class NoduleCatalogWriter(PipelinePart):
         if ct_header is not None:
             patient_id = str(getattr(ct_header, 'PatientID', ''))
 
-        seg_arr = seg_data.cpu().numpy()          # (1, H, W, D)
-        ct_arr  = ct_data.cpu().numpy()           # (1, H, W, D)
-        # Read spacing from the affine — this reflects the actual resampled
-        # spacing, unlike meta['pixdim'] which retains the original DICOM value.
-        affine       = seg_data.affine.cpu().numpy()
-        spacing      = np.linalg.norm(affine[:3, :3], axis=0)
-        voxel_volume = float(np.prod(spacing))
-
-        mask_3d = seg_arr[0]                      # (H, W, D)
-        ct_3d   = ct_arr[0]
-
-        if mask_3d.max() > 1:
-            # Instance labels already assigned by NoduleInstanceSegTransform
-            nodule_ids = np.unique(mask_3d[mask_3d > 0]).astype(int)
-            nodule_masks = [(nid, mask_3d == nid) for nid in nodule_ids]
-        else:
-            labeled, n = ndi.label(mask_3d > 0)
-            nodule_masks = [(nid, labeled == nid) for nid in range(1, n + 1)]
-
-        rows = []
-        for local_label, mask in nodule_masks:
-            voxel_count = int(mask.sum())
-            if voxel_count == 0:
-                continue
-            volume  = voxel_count * voxel_volume
-            entropy = _nodule_entropy(ct_3d[mask], self._hu_clip_min, self._hu_clip_max)
-            rows.append({
+        rows = [
+            {
                 'patient_id': patient_id,
                 'series_uid': series_uid,
                 'dataset':    self._dataset,
-                'volume_mm3': round(volume, 4),
-                'entropy':    round(entropy, 6),
-            })
-
-        if not rows:
-            return data, params
+                'volume_mm3': s['volume_mm3'],
+                'entropy':    s['entropy'],
+            }
+            for s in components['stats']
+        ]
 
         Path(self._catalog_path).parent.mkdir(parents=True, exist_ok=True)
 
