@@ -1,6 +1,14 @@
-monai[all]
-pydicom
-dcm2niix
-idc-index
-pyyaml
-tomli; python_version < "3.11"
+# Core ML framework — installs scipy, numpy, nibabel, matplotlib, tqdm, etc.
+monai[all]==1.5.1
+
+# PyTorch — pin here to control CUDA toolkit version (12.8 wheels)
+torch==2.9.1
+torchvision==0.24.1
+
+# Pipeline-specific direct dependencies not covered by monai[all]
+pandas==2.2.3
+pydicom==3.0.1
+dcm2niix==1.0.20250506
+idc-index==0.11.7
+pyyaml==6.0.3
+tomli==2.2.1; python_version < "3.11"
