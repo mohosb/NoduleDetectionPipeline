@@ -55,17 +55,28 @@ class DICOMFileSystemReader(PipelinePart):
             os.path.getsize(f) for f in glob(os.path.join(path, '*.dcm'))
         )
         with SmartTemporaryDirectory(required_space) as temp_dir:
-            subprocess.run(
-                ['dcm2niix', '-a', 'y', '-z', 'n', '-o', temp_dir, '-f', '_temp_dcm2niix_file', str(path)],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
-            nii_path = os.path.join(temp_dir, '_temp_dcm2niix_file.nii')
-            if not os.path.exists(nii_path):
+            try:
+                subprocess.run(
+                    ['dcm2niix', '-z', 'n', '-o', temp_dir, '-f', '_temp_dcm2niix_file', str(path)],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                )
+            except subprocess.CalledProcessError as e:
+                stderr_text = e.stderr.decode(errors='replace').strip() if e.stderr else '(no output)'
+                raise RuntimeError(
+                    f'dcm2niix failed for {os.path.basename(path)}: {stderr_text}'
+                ) from None
+            # Use a glob rather than an exact name: newer dcm2niix versions append
+            # timestamps or echo suffixes (e.g. _temp_dcm2niix_file_20240101.nii).
+            nii_files = sorted(glob(os.path.join(temp_dir, '_temp_dcm2niix_file*.nii')))
+            if not nii_files:
                 raise FileNotFoundError(
                     f'dcm2niix exited successfully but produced no output for: {path}'
                 )
+            # If dcm2niix splits a series into multiple volumes, take the largest
+            # (most voxels), which is always the primary CT volume.
+            nii_path = max(nii_files, key=os.path.getsize)
             data = self._backend(nii_path)
         return data
 
